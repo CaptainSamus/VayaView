@@ -246,6 +246,7 @@ export function createParlorHandler(options = {}) {
         width: entry.width ?? 0,
         height: entry.height ?? 0,
         size: entry.size,
+        addedMs: Math.round(entry.mtimeMs ?? 0),
         direct,
         missing,
         audio: entry.audio,
@@ -438,7 +439,9 @@ export function createParlorHandler(options = {}) {
       if (burn == null) args.push("-vf", "scale=-2:'min(1080,ih)'");
       args.push(...encode);
     }
-    args.push("-c:a", "aac", "-ac", "2", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "pipe:1");
+    // Half-second pieces: the player can start on the first one instead of waiting for a whole
+    // keyframe interval, which is many seconds on some Blu-ray rips.
+    args.push("-c:a", "aac", "-ac", "2", "-b:a", "192k", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-frag_duration", "500000", "pipe:1");
     res.statusCode = 200;
     res.setHeader("Content-Type", "video/mp4");
     if (usesNvenc(encode)) nvencRoom();
@@ -593,11 +596,12 @@ export function createParlorHandler(options = {}) {
     run(FFMPEG, ["-v", "error", "-ss", String(t), "-t", "1200", "-i", source, ...map, "-f", "webvtt", "pipe:1"], res);
   }
 
-  function sendKeyframe(res, entry, t) {
+  /** `near`: the closest keyframe either side (on-demand play, where the video is the clock). */
+  function sendKeyframe(res, entry, t, near = false) {
     // Flipping past a station drops its question; ffprobe stops with it.
     const child = execFile(
       FFPROBE,
-      ["-v", "error", "-select_streams", "v:0", "-read_intervals", `${Math.max(0, t - 20)}%${t}`, "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", entry.file],
+      ["-v", "error", "-select_streams", "v:0", "-read_intervals", `${Math.max(0, t - 20)}%${near ? t + 10 : t}`, "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", entry.file],
       { timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
       (error, stdout) => {
         let best = null;
@@ -605,7 +609,8 @@ export function createParlorHandler(options = {}) {
         for (const line of String(stdout ?? "").split(/\r?\n/)) {
           const [pts, dts, flags] = line.split(",");
           const value = Number(pts);
-          if (!flags?.includes("K") || !Number.isFinite(value) || value > t || (best != null && value <= best)) continue;
+          if (!flags?.includes("K") || !Number.isFinite(value)) continue;
+          if (near ? best != null && Math.abs(value - t) >= Math.abs(best - t) : value > t || (best != null && value <= best)) continue;
           best = value;
           delay = Number.isFinite(Number(dts)) ? Math.max(0, value - Number(dts)) : 0;
         }
@@ -737,12 +742,16 @@ export function createParlorHandler(options = {}) {
     return response.json();
   }
 
+  const META_VERSION = 2;
+
   async function lookUp(item, token) {
     const query = encodeURIComponent(item.title);
     const kind = item.kind === "tv" ? "tv" : "movie";
     const yearParam = kind === "movie" ? "primary_release_year" : "first_air_date_year";
-    let hits = (await tmdbGet(`/search/${kind}?query=${query}${item.year ? `&${yearParam}=${item.year}` : ""}`, token)).results ?? [];
-    if (hits.length === 0 && item.year) hits = (await tmdbGet(`/search/${kind}?query=${query}`, token)).results ?? [];
+    // Already matched before posters were kept: fetch the same title again by its id, no search.
+    const known = item.tmdbId && /^(movie|tv)\/\d+$/.test(item.tmdbId) ? item.tmdbId : null;
+    let hits = known ? [{ id: Number(known.split("/")[1]) }] : (await tmdbGet(`/search/${kind}?query=${query}${item.year ? `&${yearParam}=${item.year}` : ""}`, token)).results ?? [];
+    if (!known && hits.length === 0 && item.year) hits = (await tmdbGet(`/search/${kind}?query=${query}`, token)).results ?? [];
     const hit = hits[0];
     if (!hit) return { found: false };
     const detail = await tmdbGet(`/${kind}/${hit.id}?append_to_response=keywords${kind === "movie" ? ",credits" : ""}`, token);
@@ -760,6 +769,11 @@ export function createParlorHandler(options = {}) {
           : (detail.created_by ?? []).map((person) => person.name).join(", "),
       keywords,
       overview: detail.overview ?? "",
+      poster: detail.poster_path ?? null,
+      backdrop: detail.backdrop_path ?? null,
+      rating: Math.round((detail.vote_average ?? 0) * 10) / 10,
+      collectionId: detail.belongs_to_collection?.id ?? null,
+      v: META_VERSION,
     };
   }
 
@@ -767,7 +781,10 @@ export function createParlorHandler(options = {}) {
     const token = readJson(tmdbFile, {}).token;
     if (!token || tmdb.running) return;
     const meta = readJson(metaFile, {});
-    const todo = items.filter((item) => item?.key && item.title && !meta[item.key]);
+    // Version 2 added posters, backdrops and ratings. Older matches are fetched once more by id.
+    const todo = items
+      .filter((item) => item?.key && item.title && (!meta[item.key] || (meta[item.key].found && (meta[item.key].v ?? 1) < META_VERSION)))
+      .map((item) => (meta[item.key]?.found ? { ...item, tmdbId: meta[item.key].tmdbId } : item));
     if (todo.length === 0) return;
     Object.assign(tmdb, { running: true, done: 0, total: todo.length, error: null });
     try {
@@ -785,6 +802,76 @@ export function createParlorHandler(options = {}) {
     }
     fs.writeFileSync(metaFile, JSON.stringify(meta));
     tmdb.running = false;
+  }
+
+  // ------------------------------------------------ Films not in the library
+  // The rest of each franchise the library has a film from, plus TMDB's top rated
+  // films. Kept in a file and refreshed weekly; the app works out which are missing.
+  const catalogFile = path.join(dataDir, "parlor-catalog.json");
+  const catalogState = { building: false, error: null };
+  const WEEK = 7 * 86_400_000;
+  const today = () => new Date().toISOString().slice(0, 10);
+  const partOf = (item, genreNames) => ({
+    id: item.id,
+    title: item.title ?? item.name ?? "",
+    year: Number(String(item.release_date ?? "").slice(0, 4)) || 0,
+    poster: item.poster_path ?? null,
+    backdrop: item.backdrop_path ?? null,
+    overview: item.overview ?? "",
+    rating: Math.round((item.vote_average ?? 0) * 10) / 10,
+    genres: (item.genre_ids ?? []).map((id) => genreNames[id]).filter(Boolean),
+  });
+  // Only films that are out: an unreleased film can't be downloaded yet.
+  const released = (item) => item.release_date && item.release_date <= today();
+
+  async function buildCatalog(force = false) {
+    const token = readJson(tmdbFile, {}).token;
+    if (!token || catalogState.building) return;
+    const catalog = readJson(catalogFile, { collections: {}, top: [], topAt: 0, genres: {} });
+    const wanted = new Set(
+      Object.values(readJson(metaFile, {}))
+        .filter((item) => item.found && item.collectionId && String(item.tmdbId).startsWith("movie/"))
+        .map((item) => String(item.collectionId)),
+    );
+    const stale = (entry) => force || !entry || Date.now() - (entry.at ?? 0) > WEEK;
+    const todo = [...wanted].filter((id) => stale(catalog.collections[id]));
+    const topDue = force || Date.now() - (catalog.topAt ?? 0) > WEEK;
+    if (todo.length === 0 && !topDue) return;
+    Object.assign(catalogState, { building: true, error: null });
+    try {
+      if (topDue || !Object.keys(catalog.genres ?? {}).length) {
+        const list = await tmdbGet("/genre/movie/list", token);
+        catalog.genres = Object.fromEntries((list.genres ?? []).map((genre) => [genre.id, genre.name]));
+      }
+      await pool(todo, 4, async (id) => {
+        try {
+          const detail = await tmdbGet(`/collection/${id}`, token);
+          catalog.collections[id] = { name: detail.name ?? "", at: Date.now(), parts: (detail.parts ?? []).filter(released).map((item) => partOf(item, catalog.genres)) };
+        } catch (error) {
+          catalogState.error = error.message;
+        }
+      });
+      if (topDue) {
+        const top = [];
+        // Well-known films only: TMDB's own top-rated list is led by new films with few votes.
+        for (let page = 1; page <= 5; page += 1)
+          top.push(...((await tmdbGet(`/discover/movie?sort_by=vote_average.desc&vote_count.gte=4000&page=${page}`, token)).results ?? []));
+        catalog.top = top.filter(released).map((item) => partOf(item, catalog.genres));
+        catalog.topAt = Date.now();
+      }
+    } catch (error) {
+      catalogState.error = error.message;
+    }
+    fs.writeFileSync(catalogFile, JSON.stringify(catalog));
+    catalogState.building = false;
+  }
+
+  async function searchFilms(query) {
+    const token = readJson(tmdbFile, {}).token;
+    if (!token) throw new Error("Add a TMDB token in TV Guide → Settings first.");
+    const catalog = readJson(catalogFile, { genres: {} });
+    const found = await tmdbGet(`/search/movie?query=${encodeURIComponent(query)}`, token);
+    return (found.results ?? []).slice(0, 16).map((item) => partOf(item, catalog.genres ?? {}));
   }
 
   function tmdbStatus() {
@@ -826,7 +913,7 @@ export function createParlorHandler(options = {}) {
   // ---------------------------------------------------------------- iPhone video (HLS)
   // iPhones take Apple's streaming format. The picture is copied as it is whenever the
   // phone can play it, so this costs next to nothing; only odd formats are re-encoded.
-  const hlsRoot = path.join(dataDir, "temp-streams");
+  let hlsRoot = path.join(dataDir, "temp-streams");
   /**
    * Clear a stream's temporary folder. ffmpeg can still be finishing a piece in it, so this
    * retries quietly, and a folder that will not go is left for the next start-up. It never throws.
@@ -837,7 +924,16 @@ export function createParlorHandler(options = {}) {
   } catch {
     // Something from last time is still locked. New streams get their own folders anyway.
   }
-  fs.mkdirSync(hlsRoot, { recursive: true });
+  try {
+    fs.mkdirSync(hlsRoot, { recursive: true });
+  } catch {
+    // The folder is stuck half-deleted (another program still had it open, which once
+    // stopped the app from starting). Use a fresh folder for this run instead.
+    hlsRoot = path.join(dataDir, `temp-streams-${process.pid}`);
+    fs.mkdirSync(hlsRoot, { recursive: true });
+  }
+  // Fresh folders from runs like that are tidied once nothing holds them.
+  for (const name of fs.readdirSync(dataDir)) if (/^temp-streams-\d+$/.test(name) && path.join(dataDir, name) !== hlsRoot) clearDir(path.join(dataDir, name));
   const hlsSessions = new Map();
 
   function endHls(sid) {
@@ -1319,6 +1415,18 @@ export function createParlorHandler(options = {}) {
 
     if (url.pathname === "/api/tmdb" && req.method === "GET") return sendJson(res, 200, tmdbStatus());
     if (url.pathname === "/api/tmdb/metadata") return sendJson(res, 200, readJson(metaFile, {}));
+    if (url.pathname === "/api/tmdb/catalog") {
+      if (!tmdb.running) void buildCatalog(url.searchParams.get("refresh") === "1");
+      const { collections = {}, top = [] } = readJson(catalogFile, {});
+      return sendJson(res, 200, { ...catalogState, collections, top });
+    }
+    if (url.pathname === "/api/tmdb/search") {
+      try {
+        return sendJson(res, 200, { results: await searchFilms(String(url.searchParams.get("q") ?? "").slice(0, 120)) });
+      } catch (error) {
+        return sendJson(res, 400, { error: error.message });
+      }
+    }
     if (url.pathname === "/api/tmdb/token" && req.method === "POST") {
       const token = String((await readBody(req))?.token ?? "").trim();
       if (!token) {
@@ -1408,7 +1516,7 @@ export function createParlorHandler(options = {}) {
         return res.end();
       }
       if (part[1] === "subs") return sendSubs(res, part[part.length - 1], entry, url.searchParams);
-      if (part[1] === "api") return sendKeyframe(res, entry, Math.max(0, Number(url.searchParams.get("t")) || 0));
+      if (part[1] === "api") return sendKeyframe(res, entry, Math.max(0, Number(url.searchParams.get("t")) || 0), url.searchParams.get("near") === "1");
       if (url.searchParams.get("t") != null) return sendSession(res, entry, url.searchParams);
       return sendDirect(req, res, entry);
     }

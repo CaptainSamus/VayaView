@@ -78,8 +78,8 @@ async function boot() {
   // The library must be in place before the app modules build their lookups.
   await loadDiskLibrary();
   window.clearInterval(poll);
-  const { ParlorApp } = await import("./components/parlor/parlor-app");
-  root.render(<ParlorApp />);
+  const { AppShell } = await import("./components/parlor/app-shell");
+  root.render(<AppShell />);
 }
 
 void boot();

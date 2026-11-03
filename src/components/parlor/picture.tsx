@@ -32,6 +32,14 @@ type PictureProps = {
   /** Goes up each time the viewer scrubs or returns to live, so the picture jumps at once. */
   seekToken: number;
   onToggleView: () => void;
+  /** On-demand play only: hold the picture still. */
+  paused?: boolean;
+  /**
+   * On-demand play (the Streaming view). The video is its own clock: no rejoining a
+   * wall clock, a click pauses instead of muting, and no station number is shown.
+   * `request.offsetMs` is only where to start, and changes only on a seek.
+   */
+  onDemand?: { onTime: (ms: number) => void; onTogglePause: () => void; onEnded: () => void; onStream?: () => void };
   className?: string;
 };
 
@@ -58,7 +66,9 @@ function streamUrl(mediaId: string, query: string): string {
 type Level = 0 | 1 | 2;
 
 export function Picture(props: PictureProps) {
-  const { powered, channel, airing, film, request, digits, notice, audio, sub, adjust, compact, toolbar, footer, seekToken, onToggleView, className } = props;
+  const { powered, channel, airing, film, request, digits, notice, audio, sub, adjust, compact, toolbar, footer, seekToken, onToggleView, paused = false, onDemand, className } = props;
+  const onDemandRef = useRef(onDemand);
+  onDemandRef.current = onDemand;
   const station = channel ? formatStation(channel.number) : "--";
   const missing = request?.status === "missing";
 
@@ -118,6 +128,7 @@ export function Picture(props: PictureProps) {
       if (cancelled) return;
       baseRef.current = base;
       srcRef.current = src;
+      onDemandRef.current?.onStream?.();
       video.src = src;
       if (isRemote) {
         // A stream starts on the keyframe at or before the moment asked for. Skip ahead to the clock,
@@ -143,7 +154,7 @@ export function Picture(props: PictureProps) {
         // A copied picture can only start on a keyframe. Ask which one, so subtitles and the clock stay honest.
         // No keyframe nearby means no honest starting point, so that file is re-encoded instead.
         // A channel change cancels the question, and the server stops ffprobe.
-        fetch(`/api/keyframe/${mediaId}?t=${start.toFixed(2)}`, { signal: control.signal })
+        fetch(`/api/keyframe/${mediaId}?t=${start.toFixed(2)}${onDemandRef.current ? "&near=1" : ""}`, { signal: control.signal })
           .then((response) => response.json() as Promise<{ found: boolean; t: number; base: number }>)
           .catch(() => null)
           .then((body) => {
@@ -173,10 +184,34 @@ export function Picture(props: PictureProps) {
     retries.current = 0;
   }, [playKey]);
 
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video || !onDemand) return;
+    const time = () => {
+      if (!video.seeking && video.readyState >= 2) onDemandRef.current?.onTime((baseRef.current + video.currentTime) * 1000);
+    };
+    const ended = () => onDemandRef.current?.onEnded();
+    video.addEventListener("timeupdate", time);
+    video.addEventListener("ended", ended);
+    return () => {
+      video.removeEventListener("timeupdate", time);
+      video.removeEventListener("ended", ended);
+    };
+  }, [Boolean(onDemand)]);
+
   // Once a second: if the picture drifted from the clock (pause, sleep, stall), rejoin.
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !playKey || video.readyState < 3 || video.seeking) return;
+    if (!video || !playKey) return;
+    if (paused) {
+      if (!video.paused) video.pause();
+      return;
+    }
+    if (onDemandRef.current) {
+      if (video.paused && !video.ended && video.readyState >= 2) video.play().catch(() => {});
+      return;
+    }
+    if (video.readyState < 3 || video.seeking) return;
     const expected = offsetRef.current / 1000 - baseRef.current;
     if (level === 0) {
       if (Math.abs(video.currentTime - expected) > 4 && expected < video.duration) video.currentTime = expected;
@@ -187,7 +222,7 @@ export function Picture(props: PictureProps) {
       setReload((value) => value + 1);
     }
     if (video.paused && !video.ended) video.play().catch(() => {});
-  }, [airing?.offsetMs, playKey, level]);
+  }, [airing?.offsetMs, playKey, level, paused]);
 
   // A scrub, or a return to live: jump now. A session cannot seek, so it is restarted at the new spot.
   const lastSeek = useRef({ token: seekToken, key: playKey });
@@ -198,7 +233,20 @@ export function Picture(props: PictureProps) {
     if (before.token === seekToken || before.key !== playKey) return;
     const video = videoRef.current;
     if (!video || !playKey) return;
+    const target = offsetRef.current / 1000 - baseRef.current;
     if (level === 0) video.currentTime = offsetRef.current / 1000;
+    // Already loaded (a short skip back or forward): jump there at once instead of starting a new stream.
+    // (Only where the browser calls it seekable: a piped ffmpeg stream usually is not, and setting
+    // currentTime on one starts the download over from its beginning.)
+    else if (
+      onDemandRef.current &&
+      target >= 0 &&
+      [...Array(video.seekable.length).keys()].some((i) => target >= video.seekable.start(i) && target <= video.seekable.end(i) - 0.5) &&
+      [...Array(video.buffered.length).keys()].some((i) => target >= video.buffered.start(i) && target <= video.buffered.end(i) - 0.5)
+    ) {
+      video.currentTime = target;
+      onDemandRef.current.onStream?.();
+    }
     else setReload((value) => value + 1);
   }, [seekToken, playKey, level]);
 
@@ -336,7 +384,7 @@ export function Picture(props: PictureProps) {
         setPoke((value) => value + 1);
       }}
       ref={frameRef}
-      onClick={live ? toggleMute : undefined}
+      onClick={live ? (onDemand ? onDemand.onTogglePause : toggleMute) : undefined}
       onDoubleClick={onToggleView}
       className={cn("group relative h-full w-full overflow-hidden bg-screen text-cream [container-type:inline-size]", hideCard && !compact ? "cursor-none" : "", className)}
     >
@@ -416,7 +464,7 @@ export function Picture(props: PictureProps) {
 
       {live && muted ? (
         <p className="absolute top-3 left-1/2 z-20 -translate-x-1/2 rounded-full bg-black/70 px-3 py-1 text-xs text-cream">
-          Muted · click the picture for sound
+          {onDemand ? "Muted · press M for sound" : "Muted · click the picture for sound"}
         </p>
       ) : null}
 
@@ -430,15 +478,15 @@ export function Picture(props: PictureProps) {
         {/* Top left: the station number, and beside it what is on. Top right: the controls. */}
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 items-start gap-4">
-            <p className="font-title shrink-0 text-3xl leading-none font-semibold tracking-tight tabular-nums sm:text-4xl">{station}</p>
+            {onDemand ? null : <p className="font-title shrink-0 text-3xl leading-none font-semibold tracking-tight tabular-nums sm:text-4xl">{station}</p>}
             <div className="min-w-0">
               <p className="text-xs tracking-[0.22em] text-cream/70 uppercase">
-                {channel ? `${channel.callSign} · ${channel.name}` : "VayaView"}
+                {onDemand ? (channel?.name ?? "") : channel ? `${channel.callSign} · ${channel.name}` : "VayaView"}
               </p>
               {showing && airing && film ? (
                 <div key={`${airing.slot.mediaId}-${airing.cycleIndex}`} className="parlor-in mt-1.5">
                   <h1 className="font-title text-xl leading-tight sm:text-3xl">{film.title}</h1>
-                  <p className="mt-1 text-sm text-cream/70 tabular-nums">
+                  <p className={cn("mt-1 text-sm text-cream/70 tabular-nums", onDemand && "hidden")}>
                     {formatDuration(airing.offsetMs)} in · {formatDuration(airing.remainingMs)} left
                     {airing.next ? ` · Next ${airing.next.title} at ${formatTime(airing.endsAtMs)}` : ""}
                   </p>

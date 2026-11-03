@@ -38,6 +38,18 @@ export type Film = {
   episode?: number;
   /** The show counts episodes straight through, anime style. `episode` is the running number. */
   absolute?: boolean;
+  /** When the file arrived on disk (its modified time), for "Recently added". */
+  addedMs?: number;
+  /** Picture height in pixels, for a 4K / HD badge. */
+  height?: number;
+  /** TMDB image paths (`/abc.jpg`); see posterUrl in src/lib/library/art.ts. */
+  poster?: string | null;
+  backdrop?: string | null;
+  /** TMDB average score out of 10. 0 when unknown. */
+  rating?: number;
+  collectionId?: number | null;
+  /** For an episode: what the show is about. */
+  showSynopsis?: string;
   audio?: AudioTrack[];
   subs?: SubTrack[];
 };

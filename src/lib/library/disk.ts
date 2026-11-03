@@ -11,6 +11,7 @@ type DiskFile = {
   width: number;
   height: number;
   size: number;
+  addedMs?: number;
   direct: boolean;
   missing: boolean;
   audio: AudioTrack[];
@@ -60,7 +61,9 @@ function spaced(name: string): string {
  */
 export function guessTitle(name: string): { title: string; year: number } {
   const tokens = spaced(name.replace(/\.[a-z0-9]{2,4}$/i, "")).split(" ");
-  const yearAt = tokens.findIndex((token, i) => i > 0 && /^(19|20)\d{2}$/.test(token));
+  let yearAt = tokens.findIndex((token, i) => i > 0 && /^(19|20)\d{2}$/.test(token));
+  // "Blade.Runner.2049.2017": the last year in a run is the release year; the ones before belong to the title.
+  while (yearAt > 0 && /^(19|20)\d{2}$/.test(tokens[yearAt + 1] ?? "")) yearAt += 1;
   const noiseAt = tokens.findIndex((token, i) => i > 0 && RELEASE_NOISE.test(token));
   const end = yearAt > 0 ? yearAt : noiseAt > 0 ? noiseAt : tokens.length;
   return { title: tokens.slice(0, end).join(" "), year: yearAt > 0 ? Number(tokens[yearAt]) : 0 };
@@ -169,6 +172,8 @@ export function buildLibrary(files: DiskFile[]): Film[] {
       filePath: file.path,
       metadataId: null,
       fileName,
+      addedMs: file.addedMs ?? 0,
+      height: file.height,
       direct: file.direct,
       vcodec: file.vcodec,
       audio: file.audio,
@@ -265,7 +270,15 @@ export function buildLibrary(files: DiskFile[]): Film[] {
   return [...movies, ...shows];
 }
 
-type Meta = { found: boolean; tmdbId?: string; genres?: string[]; collection?: string | null; director?: string; keywords?: string[]; overview?: string };
+type Meta = { found: boolean; tmdbId?: string; year?: number; genres?: string[]; collection?: string | null; director?: string; keywords?: string[]; overview?: string;
+  poster?: string | null;
+  backdrop?: string | null;
+  rating?: number;
+  collectionId?: number | null;
+  v?: number;
+};
+/** Matches older than this are fetched again once, to pick up posters and ratings. */
+const META_VERSION = 2;
 
 /** "Doctor.Who.2005.S02E01" → 2005, so TMDB is asked about the right Doctor Who. */
 function showYear(show: string, films: Film[]): string {
@@ -301,12 +314,17 @@ async function applyMetadata(films: Film[]): Promise<void> {
     const hit = meta[key];
     if (!hit?.found) continue;
     Object.assign(film, {
+      year: hit.year || film.year,
       genres: ["Movie", ...(hit.genres ?? [])],
       collection: hit.collection ?? null,
       director: hit.director ?? "",
       keywords: hit.keywords ?? [],
       synopsis: hit.overview ?? "",
       metadataId: hit.tmdbId ?? null,
+      poster: hit.poster ?? null,
+      backdrop: hit.backdrop ?? null,
+      rating: hit.rating ?? 0,
+      collectionId: hit.collectionId ?? null,
     });
   }
   for (const [show, episodes] of byShow) {
@@ -321,11 +339,15 @@ async function applyMetadata(films: Film[]): Promise<void> {
         director: hit.director ?? "",
         keywords: hit.keywords ?? [],
         metadataId: hit.tmdbId ?? null,
+        poster: hit.poster ?? null,
+        backdrop: hit.backdrop ?? null,
+        rating: hit.rating ?? 0,
+        showSynopsis: hit.overview ?? "",
       });
     }
   }
   libraryInfo.metaItems = items;
-  if (!isRemote && items.some((item) => !meta[item.key])) {
+  if (!isRemote && items.some((item) => !meta[item.key] || (meta[item.key].found && (meta[item.key].v ?? 1) < META_VERSION))) {
     void fetch("/api/tmdb/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) }).catch(() => {});
   }
 }

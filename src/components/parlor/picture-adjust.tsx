@@ -86,7 +86,7 @@ export function LiftFilter({ lift }: { lift: number }) {
 }
 
 /** Black level, brightness and contrast for this film only, folded away behind one button. */
-export function PictureMenu({ picture, className }: { picture: PictureAdjust; className?: string }) {
+export function PictureMenu({ picture, className, icon = false }: { picture: PictureAdjust; className?: string; icon?: boolean }) {
   const [open, setOpen] = useState(false);
   const { value, film, changed } = picture;
   if (!film) return null;
@@ -106,6 +106,49 @@ export function PictureMenu({ picture, className }: { picture: PictureAdjust; cl
       <span className="w-10 shrink-0 text-right tabular-nums">{show(value[field])}</span>
     </label>
   );
+
+  const sliders = (
+    <>
+      {slider("Black level", "lift", 0, 0.25, (v) => `+${Math.round(v * 100)}`)}
+      {slider("Brightness", "brightness", 0.5, 1.5, (v) => `${Math.round(v * 100)}%`)}
+      {slider("Contrast", "contrast", 0.5, 1.5, (v) => `${Math.round(v * 100)}%`)}
+    </>
+  );
+
+  // A gear button whose panel drops down under it (the streaming player).
+  if (icon)
+    return (
+      <div className={`relative ${className ?? ""}`}>
+        <button
+          type="button"
+          aria-expanded={open}
+          aria-label="Picture settings"
+          title="Picture settings"
+          onClick={() => setOpen((value) => !value)}
+          className={`relative grid size-9 place-items-center rounded-full transition-colors ${open ? "bg-cream/25 text-cream" : "bg-black/40 text-cream/80 hover:bg-cream/20 hover:text-cream"}`}
+        >
+          <svg viewBox="0 0 24 24" className="size-5" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+            <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+          </svg>
+          {changed ? <span className="absolute top-1 right-1 size-2 rounded-full bg-accent" /> : null}
+        </button>
+        {open ? (
+          <div className="absolute top-full right-0 z-30 mt-2 w-72 space-y-1.5 rounded-xl bg-black/80 p-3 shadow-2xl backdrop-blur-md">
+            <div className="flex items-center justify-between pb-1 text-xs font-semibold text-cream/80">
+              <span>Picture</span>
+              {changed ? (
+                <button type="button" onClick={picture.reset} className="font-normal text-cream/50 hover:text-cream">
+                  Reset
+                </button>
+              ) : null}
+            </div>
+            {sliders}
+            <p className="text-[0.7rem] text-cream/45">Only for {film.title}. Other films stay as they are.</p>
+          </div>
+        ) : null}
+      </div>
+    );
 
   return (
     <div className={className}>

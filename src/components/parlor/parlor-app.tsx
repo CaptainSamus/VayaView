@@ -16,6 +16,7 @@ import { TrackMenu, useTracks } from "./tracks";
 import { PictureMenu, usePictureAdjust } from "./picture-adjust";
 import { scheduleLibrary, useParlor } from "./use-parlor";
 import { durable } from "@/lib/durable";
+import { ModeSwitch, type AppMode } from "./mode-switch";
 
 const buttonClass = "rounded-md bg-cream/10 px-3 py-1.5 text-xs text-cream hover:bg-cream/20";
 /** The everyday buttons (Last, Full view, Edit stations): heavier, so they stand out from the rest. */
@@ -33,7 +34,7 @@ type Held = { channelId: string; airing: Airing; film: Film; startMs: number };
  * above the listings. Full view is only the picture. G or a double click
  * switches. The player is the same element in both, so switching never reloads it.
  */
-export function ParlorApp() {
+export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
   const parlor = useParlor();
   const { state, channel, now } = parlor;
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -293,10 +294,13 @@ export function ParlorApp() {
         {full ? null : (
           <section aria-label="On now" className="flex min-h-0 min-w-0 flex-col overflow-y-auto rounded-screen bg-bezel p-5">
             <div className="flex items-start justify-between gap-4">
-              <p className="text-xs tracking-[0.2em] text-cream/60 uppercase">
+              <p className="min-w-0 truncate text-xs tracking-[0.2em] text-cream/60 uppercase">
                 {channel ? `${channel.callSign} · ${channel.name}` : "VayaView"}
               </p>
-              <p className="text-sm text-cream/60 tabular-nums">{now != null ? formatTime(now) : ""}</p>
+              <div className="flex shrink-0 items-center gap-3">
+                {onMode ? <ModeSwitch mode="tv" onMode={onMode} /> : null}
+                <p className="text-sm text-cream/60 tabular-nums">{now != null ? formatTime(now) : ""}</p>
+              </div>
             </div>
 
             <div className="mt-3 flex items-baseline gap-4">
