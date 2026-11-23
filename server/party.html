@@ -1,0 +1,194 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#12100e">
+<title>VayaView Party</title>
+<style>
+  :root { --bg:#12100e; --card:#1d1a17; --line:#2c2823; --text:#f3e9d8; --dim:#a89d8c; --accent:#ff4d3a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:16px/1.35 system-ui, -apple-system, "Segoe UI", sans-serif; padding:16px 16px 40px; max-width:640px; margin-inline:auto; }
+  h1 { font-size:20px; margin:4px 0 14px; letter-spacing:.02em; }
+  h1 span { color:var(--accent); }
+  h2 { font-size:13px; text-transform:uppercase; letter-spacing:.15em; color:var(--dim); margin:22px 0 8px; }
+  .now { display:flex; gap:14px; align-items:center; background:var(--card); border-radius:16px; padding:12px; }
+  .now img { width:84px; height:84px; border-radius:10px; object-fit:cover; background:#000; flex:none; }
+  .now .t { font-weight:700; font-size:18px; }
+  .dim { color:var(--dim); font-size:14px; }
+  .bar { height:4px; background:var(--line); border-radius:2px; margin-top:8px; overflow:hidden; }
+  .bar i { display:block; height:100%; background:var(--accent); width:0; }
+  input[type=search], input[type=text] { width:100%; font:inherit; color:var(--text); background:var(--card); border:1px solid var(--line); border-radius:12px; padding:12px 14px; outline:none; }
+  input:focus { border-color:var(--accent); }
+  .tabs { display:flex; gap:8px; margin:12px 0 8px; }
+  .tabs button { flex:1; }
+  button { font:inherit; font-weight:600; color:var(--text); background:var(--card); border:1px solid var(--line); border-radius:999px; padding:9px 14px; cursor:pointer; }
+  button.on, button.add { background:var(--accent); color:#12100e; border-color:transparent; }
+  button:disabled { opacity:.5; }
+  ul { list-style:none; margin:0; padding:0; }
+  li { display:flex; gap:12px; align-items:center; padding:8px 0; border-bottom:1px solid var(--line); }
+  li img { width:48px; height:48px; border-radius:6px; object-fit:cover; background:var(--card); flex:none; }
+  li .grow { flex:1; min-width:0; }
+  li .name { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-weight:600; }
+  li .sub { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; color:var(--dim); font-size:13px; }
+  .badge { font-size:11px; font-weight:700; color:var(--accent); border:1px solid var(--accent); border-radius:6px; padding:0 5px; margin-left:6px; vertical-align:1px; }
+  .msg { padding:14px; background:var(--card); border-radius:12px; color:var(--dim); }
+  .toast { position:fixed; left:50%; bottom:20px; transform:translateX(-50%); background:var(--accent); color:#12100e; font-weight:700; padding:10px 18px; border-radius:999px; opacity:0; transition:opacity .2s; pointer-events:none; }
+  .toast.show { opacity:1; }
+  .row { display:flex; gap:8px; align-items:center; }
+  .row button { flex:none; }
+  label { color:var(--dim); font-size:14px; display:flex; gap:6px; align-items:center; }
+</style>
+</head>
+<body>
+<h1>Vaya<span>View</span> Party</h1>
+<div id="gate" class="msg" hidden></div>
+<div id="app" hidden>
+  <div class="row" style="margin-bottom:12px"><input id="me" type="text" maxlength="24" placeholder="Your name"></div>
+  <div id="now"></div>
+  <div class="tabs"><button id="tabSearch" class="on">Search songs</button><button id="tabLists">Playlists</button></div>
+  <div id="searchPane">
+    <input id="q" type="search" placeholder="Song or artist" autocomplete="off" enterkeyhint="search">
+    <ul id="results"></ul>
+    <button id="more" hidden style="margin-top:10px;width:100%">More results</button>
+  </div>
+  <div id="listPane" hidden>
+    <div id="pickPane">
+      <h2 style="margin-top:6px">Your playlist</h2>
+      <div class="row"><input id="link" type="text" placeholder="Paste your playlist's link" autocomplete="off"><button id="open" class="add">Open</button></div>
+      <p class="dim" style="margin:6px 2px 0;font-size:13px">In Spotify: open the playlist, tap ⋯ → Share → Copy link. It has to be public.</p>
+      <h2>The host's newest playlists</h2>
+      <ul id="lists"></ul>
+    </div>
+    <div id="songsPane" hidden>
+      <div class="row" style="margin:8px 0"><button id="back">‹ Back</button><div id="plName" style="font-weight:700;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"></div></div>
+      <ul id="songs"></ul>
+    </div>
+  </div>
+  <h2>Up next</h2>
+  <ul id="queue"></ul>
+</div>
+<div id="toast" class="toast"></div>
+<script>
+(() => {
+  const code = new URLSearchParams(location.search).get("c") || "";
+  const $ = (id) => document.getElementById(id);
+  const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const time = (ms) => { const s = Math.max(0, Math.round((ms || 0) / 1000)); return Math.floor(s / 60) + ":" + String(s % 60).padStart(2, "0"); };
+  let me = ""; try { me = localStorage.getItem("vv.partyName") || ""; } catch {}
+  $("me").value = me;
+  $("me").addEventListener("change", () => { me = $("me").value.trim(); try { localStorage.setItem("vv.partyName", me); } catch {} });
+
+  const gate = (text) => { $("gate").textContent = text; $("gate").hidden = false; $("app").hidden = true; };
+  async function call(path, body) {
+    const res = await fetch(path, { method: body ? "POST" : "GET", headers: { "x-party-code": code, ...(body ? { "Content-Type": "application/json" } : {}) }, body: body ? JSON.stringify(body) : undefined });
+    const json = await res.json().catch(() => ({}));
+    if (res.status === 403 && json.error === "code") { gate("This QR code is old. Scan the one on the TV again."); throw new Error("code"); }
+    if (!res.ok) throw new Error(json.error || "Something went wrong.");
+    return json;
+  }
+  let toastTimer;
+  const toast = (text) => { $("toast").textContent = text; $("toast").classList.add("show"); clearTimeout(toastTimer); toastTimer = setTimeout(() => $("toast").classList.remove("show"), 2200); };
+
+  let state = null, stateAt = 0;
+  // The card and the list are only rebuilt when something in them changes; rebuilding them every second
+  // made the cover pictures flash black while they loaded again.
+  let nowDrawn = "", queueDrawn = "";
+  function drawNow() {
+    const now = state && state.now;
+    if (!now) { if (nowDrawn !== "none") $("now").innerHTML = '<div class="msg">Nothing is playing yet. Add a song!</div>'; nowDrawn = "none"; return; }
+    const ms = now.progressMs + (state.playing && now.mode === "spotify" && !now.paused ? Date.now() - stateAt : 0);
+    const id = now.key + "|" + now.mode;
+    if (nowDrawn !== id) {
+      nowDrawn = id;
+      const from = now.fromPlaylist ? " · from " + esc(now.fromPlaylist) : now.by ? " · added by " + esc(now.by) : "";
+      $("now").innerHTML = '<div class="now"><img src="' + esc(now.art && now.art.small) + '" alt=""><div style="min-width:0;flex:1"><div class="t">' + esc(now.name) +
+        (now.mode === "video" ? '<span class="badge">MUSIC VIDEO</span>' : "") + '</div><div class="dim">' + esc(now.artists.join(", ")) + from +
+        '</div>' + (now.mode === "spotify" ? '<div class="bar"><i id="nowBar"></i></div><div id="nowTime" class="dim" style="font-size:12px;margin-top:4px"></div>' : "") + "</div></div>";
+    }
+    if (now.mode === "spotify" && $("nowBar")) {
+      $("nowBar").style.width = Math.min(100, (ms / now.durationMs) * 100) + "%";
+      $("nowTime").textContent = time(ms) + " / " + time(now.durationMs);
+    }
+  }
+  function drawQueue() {
+    const q = state ? state.queue : [];
+    const id = q.map((item) => item.key).join(",");
+    if (id === queueDrawn) return;
+    queueDrawn = id;
+    $("queue").innerHTML = q.length ? q.slice(0, 100).map((item, i) =>
+      '<li><img src="' + esc(item.art && item.art.small) + '" alt=""><div class="grow"><div class="name">' + (i + 1) + ". " + esc(item.name) + (item.hasVideo ? '<span class="badge">VIDEO</span>' : "") +
+      '</div><div class="sub">' + esc(item.artists.join(", ")) + (item.by ? " · " + esc(item.by) : "") + "</div></div></li>").join("") + (q.length > 100 ? '<li class="dim">…and ' + (q.length - 100) + " more</li>" : "")
+      : '<li class="dim">The queue is empty.</li>';
+  }
+  let pageSeen = "";
+  async function refresh() {
+    try {
+      state = await call("/api/party/state"); stateAt = Date.now();
+      // VayaView was updated: load the new page (an open page otherwise keeps running the old one).
+      if (state.page) { if (pageSeen && state.page !== pageSeen) { location.reload(); return; } pageSeen = state.page; } $("app").hidden = false; $("gate").hidden = true; drawNow(); drawQueue(); }
+    catch (e) { if (e.message !== "code") gate(e.message); }
+  }
+  setInterval(refresh, 3000);
+  setInterval(() => state && drawNow(), 1000);
+  if (!code) gate("Scan the QR code on the TV to join the party."); else refresh();
+
+  // Search
+  let query = "", offset = 0, searchTimer;
+  const trackRow = (t) => '<li><img src="' + esc(t.art.small) + '" alt=""><div class="grow"><div class="name">' + esc(t.name) + '</div><div class="sub">' + esc(t.artists.join(", ")) + " · " + time(t.durationMs) +
+    '</div></div><button class="add" data-id="' + esc(t.id) + '">Add</button></li>';
+  async function search(more) {
+    if (!more) { offset = 0; $("results").innerHTML = ""; }
+    if (!query) { $("more").hidden = true; return; }
+    try {
+      const { tracks } = await call("/api/party/search?q=" + encodeURIComponent(query) + "&offset=" + offset);
+      $("results").insertAdjacentHTML("beforeend", tracks.length ? tracks.map(trackRow).join("") : more ? "" : '<li class="dim">No songs found.</li>');
+      offset += tracks.length;
+      $("more").hidden = tracks.length < 10 || offset >= 50;
+    } catch (e) { toast(e.message); }
+  }
+  $("q").addEventListener("input", () => { clearTimeout(searchTimer); searchTimer = setTimeout(() => { query = $("q").value.trim(); search(false); }, 350); });
+  $("more").addEventListener("click", () => search(true));
+  const addSong = async (event) => {
+    const button = event.target.closest("button[data-id]");
+    if (!button) return;
+    button.disabled = true;
+    try { state = await call("/api/party/add", { id: button.dataset.id, by: me }); stateAt = Date.now(); drawQueue(); button.textContent = "Added"; toast("Added to the queue"); }
+    catch (e) { button.disabled = false; toast(e.message); }
+  };
+  $("results").addEventListener("click", addSong);
+  $("songs").addEventListener("click", addSong);
+
+  // Playlists: open one (the host's newest few, or the guest's own by its link) and add songs one by one.
+  let listsLoaded = false;
+  async function loadLists() {
+    if (listsLoaded) return;
+    try {
+      const { playlists } = await call("/api/party/playlists");
+      listsLoaded = true;
+      $("lists").innerHTML = playlists.length ? playlists.map((pl) => '<li><img src="' + esc(pl.art) + '" alt=""><div class="grow"><div class="name">' + esc(pl.name) + '</div><div class="sub">' + pl.count +
+        ' songs</div></div><button data-pl="' + esc(pl.id) + '">Open</button></li>').join("") : '<li class="dim">The host has no playlists.</li>';
+    } catch (e) { toast(e.message); }
+  }
+  async function openPlaylist(id, button) {
+    if (button) button.disabled = true;
+    try {
+      const pl = await call("/api/party/playlist-songs?id=" + encodeURIComponent(id));
+      $("plName").textContent = pl.name;
+      $("songs").innerHTML = pl.tracks.length ? pl.tracks.map(trackRow).join("") : '<li class="dim">No songs in this playlist.</li>';
+      $("pickPane").hidden = true; $("songsPane").hidden = false;
+      window.scrollTo(0, 0);
+    } catch (e) { toast(e.message); }
+    if (button) button.disabled = false;
+  }
+  $("lists").addEventListener("click", (event) => { const button = event.target.closest("button[data-pl]"); if (button) openPlaylist(button.dataset.pl, button); });
+  $("open").addEventListener("click", () => { const link = $("link").value.trim(); if (link) openPlaylist(link, $("open")); else toast("Paste a playlist link first."); });
+  $("link").addEventListener("keydown", (event) => { if (event.key === "Enter") $("open").click(); });
+  $("back").addEventListener("click", () => { $("songsPane").hidden = true; $("pickPane").hidden = false; });
+  const tab = (lists) => { $("tabSearch").classList.toggle("on", !lists); $("tabLists").classList.toggle("on", lists); $("searchPane").hidden = lists; $("listPane").hidden = !lists; if (lists) loadLists(); };
+  $("tabSearch").addEventListener("click", () => tab(false));
+  $("tabLists").addEventListener("click", () => tab(true));
+})();
+</script>
+</body>
+</html>

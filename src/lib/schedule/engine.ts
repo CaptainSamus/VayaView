@@ -74,8 +74,19 @@ export function totalDuration(slots: readonly Slot[]): number {
 
 /** Loop keeps marathon order. Shuffle is stable for a given cycle index. */
 export function cycleOrder(slots: readonly Slot[], channel: Channel, cycleIndex: number): Slot[] {
-  if (channel.mode === "loop") return slots.slice();
-  return seededShuffle(slots, `${channel.shuffleSeed}:${cycleIndex}`);
+  // Two items alternate in a fixed order, so neither ever plays twice in a row.
+  if (channel.mode === "loop" || slots.length <= 2) return slots.slice();
+  const order = seededShuffle(slots, `${channel.shuffleSeed}:${cycleIndex}`);
+  // A new round never opens with the programme the last round ended on: that one
+  // trades places with one from the middle. The last place is never touched, so the
+  // previous round's ending is always its plain shuffle.
+  const before = seededShuffle(slots, `${channel.shuffleSeed}:${cycleIndex - 1}`);
+  const last = before[before.length - 1]?.mediaId;
+  if (order[0]?.mediaId === last) {
+    const middle = Math.floor(order.length / 2);
+    [order[0], order[middle]] = [order[middle] as Slot, order[0] as Slot];
+  }
+  return order;
 }
 
 export function onNow(
@@ -88,7 +99,9 @@ export function onNow(
   const total = totalDuration(slots);
   if (total <= 0 || !Number.isFinite(nowMs)) return null;
 
-  const elapsed = nowMs - channel.anchorMs;
+  // A skip for today moves the clock only until midnight.
+  const today = channel.skipToday && nowMs < channel.skipToday.until ? channel.skipToday.byMs : 0;
+  const elapsed = nowMs - (channel.anchorMs + today);
   const cycleIndex = Math.floor(elapsed / total);
   const within = elapsed - cycleIndex * total;
   const order = cycleOrder(slots, channel, cycleIndex);

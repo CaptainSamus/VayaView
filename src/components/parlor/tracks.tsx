@@ -124,7 +124,7 @@ export function useTracks(film: Film | null) {
 export type Tracks = ReturnType<typeof useTracks>;
 
 const selectClass =
-  "min-w-0 max-w-full rounded-md bg-black/60 px-2 py-1.5 text-xs text-cream outline-1 outline-cream/20 focus:outline-accent disabled:opacity-40";
+  "min-w-0 max-w-full rounded-md bg-black/35 px-2 py-1.5 text-xs text-cream outline-1 outline-cream/20 focus:outline-accent disabled:opacity-40";
 
 /** Sound and subtitle pickers. Lists only what the file actually carries. */
 export function TrackMenu({ tracks, className }: { tracks: Tracks; className?: string }) {

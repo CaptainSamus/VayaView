@@ -9,6 +9,10 @@ const button = "rounded-md bg-cream/10 px-3 py-1.5 text-xs text-cream hover:bg-c
 export function PhoneAccess() {
   const [status, setStatus] = useState<PhoneStatus | null>(null);
   const [busy, setBusy] = useState(false);
+  const [pinDraft, setPinDraft] = useState("");
+  useEffect(() => {
+    if (status) setPinDraft(status.pin);
+  }, [status]);
 
   async function send(body?: object) {
     setBusy(true);
@@ -55,15 +59,37 @@ export function PhoneAccess() {
               </p>
             ))
           )}
-          <p className="mt-2 text-cream/70">
-            PIN <span className="ml-1 text-base font-semibold tracking-[0.3em] text-cream tabular-nums">{status.pin}</span>
-          </p>
+          <form
+            className="mt-2 flex flex-wrap items-center gap-2 text-cream/70"
+            onSubmit={(event) => {
+              event.preventDefault();
+              if (/^\d{4,8}$/.test(pinDraft)) void send({ pin: pinDraft });
+            }}
+          >
+            PIN
+            <input
+              value={pinDraft}
+              onChange={(event) => setPinDraft(event.target.value.replace(/\D/g, "").slice(0, 8))}
+              inputMode="numeric"
+              aria-label="PIN"
+              className="w-28 rounded-md bg-cream/10 px-2 py-1 text-base font-semibold tracking-[0.2em] text-cream tabular-nums outline-none focus:bg-cream/15"
+            />
+            {pinDraft !== status.pin ? (
+              <button type="submit" className={cn(button, "bg-accent font-semibold text-room hover:bg-accent")} disabled={busy || !/^\d{4,8}$/.test(pinDraft)}>
+                Apply
+              </button>
+            ) : null}
+            <span className="text-cream/45">Type a new 4–8 digit PIN to change it. Paired phones and TVs stay paired.</span>
+          </form>
+          {status.addresses[0] ? (
+            <p className="mt-2 text-cream/70">
+              Fire TV: in the Downloader app, enter{" "}
+              <span className="font-semibold text-cream select-all">{`${status.addresses[0].replace(/\/$/, "")}/tv`}</span> to install VayaView. It finds this PC by itself.
+            </p>
+          ) : null}
           <p className="mt-2 text-cream/45">
             {status.paired} phone{status.paired === 1 ? "" : "s"} paired. The first time, Windows may ask whether to let VayaView use the network: allow it on private networks.
           </p>
-          <button type="button" className={cn(button, "mt-2")} disabled={busy} onClick={() => send({ forget: true })}>
-            New PIN and forget paired phones
-          </button>
         </div>
       ) : null}
     </div>

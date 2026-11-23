@@ -26,6 +26,8 @@ export type Channel = {
   favorite?: boolean;
   /** Colour of this station's bar in the guide. Favourites without one use the theme highlight. */
   color?: string;
+  /** A skip that holds only until `until` (the next midnight); then the normal schedule is back. */
+  skipToday?: { byMs: number; until: number };
 };
 
 export type SlotStatus = "ready" | "missing";

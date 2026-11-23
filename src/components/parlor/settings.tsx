@@ -13,6 +13,8 @@ type SettingsProps = {
   scanLabel: string | null;
   onRefresh: () => Promise<unknown>;
   className?: string;
+  /** Music mode: the library is the music folder; film-only sections are left out. */
+  music?: boolean;
 };
 
 const button = "rounded-md bg-cream/10 px-3 py-1.5 text-xs text-cream hover:bg-cream/20 disabled:opacity-40";
@@ -30,7 +32,7 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
  * Everything that is set once and left: updates, look, fonts, library, phone.
  * It takes the guide's place under the picture, like Edit stations.
  */
-export function Settings({ onClose, onRescan, scanLabel, onRefresh, className }: SettingsProps) {
+export function Settings({ onClose, onRescan, scanLabel, onRefresh, className, music = false }: SettingsProps) {
   // Vintage TV is big enough to want the whole panel, so it opens in place of the settings.
   const [vintage, setVintage] = useState(false);
   if (vintage) return <VintageTv className={className} onClose={() => setVintage(false)} onRescan={onRescan} />;
@@ -50,16 +52,17 @@ export function Settings({ onClose, onRescan, scanLabel, onRefresh, className }:
           <ThemePicker />
           <Fonts />
         </Section>
-        <Section title="Library">
+        <Section title={music ? "Music library" : "Library"}>
           <LibraryBar />
           <button type="button" className={cn(button, "mt-2")} disabled={scanLabel != null} onClick={onRescan}>
             {scanLabel ?? "Rescan library now"}
           </button>
-          <TmdbBox onRefresh={onRefresh} />
+          {music ? null : <TmdbBox onRefresh={onRefresh} />}
         </Section>
         <Section title="Phone">
           <PhoneAccess />
         </Section>
+        {music ? null : (
         <Section title="Vintage TV">
           <p className="mb-3 text-xs text-cream/60">
             Old cartoons, Saturday mornings and whole days taped off TV, from the Internet Archive. Downloads go into a folder that joins your library.
@@ -68,6 +71,7 @@ export function Settings({ onClose, onRescan, scanLabel, onRefresh, className }:
             Open Vintage TV
           </button>
         </Section>
+        )}
       </div>
     </section>
   );
@@ -212,7 +216,7 @@ function Fonts() {
           onChange={(event) => pick(slot, event.target.value)}
           className="min-w-0 flex-1 rounded-md bg-black/60 px-2 py-1.5 text-xs text-cream outline-1 outline-cream/20"
         >
-          <option value="">Built-in (Outfit)</option>
+          <option value="">Built-in (Inter)</option>
           {files.length > 0 ? (
             <optgroup label="Added font files">
               {files.map((file) => (

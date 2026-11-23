@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent, type ReactNode } from "react";
 import { cn } from "@/lib/cn";
 import { durable } from "@/lib/durable";
 import { formatDuration } from "@/lib/format";
 import { backdropUrl, posterUrl } from "@/lib/library/art";
 import { CATALOG, diskMissingIds } from "@/lib/library/catalog";
+import { LIBRARY_EVENT, refreshLibrary } from "@/lib/library/disk";
 import type { Film } from "@/lib/library/types";
 import { playRequestFor } from "@/lib/player/seam";
 import type { Airing, Channel } from "@/lib/schedule/types";
@@ -13,6 +14,8 @@ import { Picture } from "./picture";
 import { PictureMenu, usePictureAdjust } from "./picture-adjust";
 import { TrackMenu, useTracks } from "./tracks";
 import { isRemote } from "@/lib/remote";
+import { useCompleteSync, useShared } from "@/lib/shared";
+import { serverNow } from "@/lib/server-clock";
 import { PlayIntro, TitlePage, type IntroKind } from "./streaming-page";
 import { GapPage, GapTile, UndoHide, WantPage } from "./streaming-missing";
 import { missingActions, useMissing, type Gap, type Missing } from "@/lib/missing";
@@ -34,6 +37,8 @@ const LOOKS: { id: Look; label: string; hint: string }[] = [
 export type Show = { name: string; episodes: Film[]; poster: string | null; backdrop: string | null; year: number; rating: number; synopsis: string; genres: string[]; addedMs: number };
 export type Pick = { kind: "film"; film: Film } | { kind: "show"; show: Show } | { kind: "collection"; name: string; films: Film[] } | { kind: "gap"; gap: Gap };
 type Playing = { film: Film; fromMs: number; session: number };
+/** Complete Sync: the film playing and its timeline. Paused: `at` is the spot; playing: `at` is when it was at 0 (wall clock). */
+type Clock = { id: string; paused: boolean; at: number } | null;
 
 const buttonClass = "rounded-md bg-cream/10 px-3 py-1.5 text-xs text-cream hover:bg-cream/20";
 const primaryClass = "rounded-md bg-accent px-4 py-2 text-sm font-semibold text-room shadow hover:brightness-110";
@@ -50,6 +55,13 @@ function dayHash(text: string) {
 }
 
 function useLibrary() {
+  // Read again whenever the library or its posters change (see refreshLibrary in disk.ts).
+  const [version, setVersion] = useState(0);
+  useEffect(() => {
+    const bump = () => setVersion((value) => value + 1);
+    window.addEventListener(LIBRARY_EVENT, bump);
+    return () => window.removeEventListener(LIBRARY_EVENT, bump);
+  }, []);
   return useMemo(() => {
     const movies: Film[] = [];
     const showMap = new Map<string, Film[]>();
@@ -91,11 +103,95 @@ function useLibrary() {
     movies.sort((a, b) => a.title.localeCompare(b.title));
     shows.sort((a, b) => a.name.localeCompare(b.name));
     return { movies, shows };
-  }, []);
+  }, [version]);
 }
 
-export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
+/**
+ * Home videos: the user's own recordings (G:\vids\VayaView Recorded Media by default, Data/parlor-home.json
+ * {folder}). Scanned on their own by the server, never on TV stations and never looked up on TMDB.
+ * The picture is a still from the video itself.
+ */
+function useHomeVideos(): Film[] {
+  const [films, setFilms] = useState<Film[]>([]);
+  useEffect(() => {
+    let live = true;
+    const load = () =>
+      fetch("/api/home")
+        .then((response) => response.json())
+        .then((data: { films: { id: string; rel: string; durationMs: number; height: number; direct: boolean; vcodec: string; addedMs?: number; missing: boolean; audio: Film["audio"]; subs: Film["subs"] }[] }) => {
+          if (!live) return;
+          setFilms(
+            (data.films ?? [])
+              .filter((file) => !file.missing)
+              .map((file) => {
+                const name = file.rel.split(/[\/]/).pop()!.replace(/.[^.]+$/, "").replace(/[._]+/g, " ").trim();
+                return {
+                  id: file.id,
+                  title: name,
+                  year: new Date(file.addedMs || Date.now()).getFullYear(),
+                  durationMs: file.durationMs,
+                  director: "",
+                  genres: ["Home video"],
+                  keywords: [],
+                  collection: null,
+                  synopsis: "",
+                  scenes: [],
+                  filePath: file.rel,
+                  metadataId: null,
+                  fileName: file.rel,
+                  addedMs: file.addedMs ?? 0,
+                  height: file.height,
+                  direct: file.direct,
+                  vcodec: file.vcodec,
+                  audio: file.audio,
+                  subs: file.subs,
+                  poster: `/api/thumb/${file.id}`,
+                  backdrop: `/api/thumb/${file.id}`,
+                } as Film;
+              })
+              .sort((a, b) => (b.addedMs ?? 0) - (a.addedMs ?? 0)),
+          );
+        })
+        .catch(() => {});
+    void load();
+    window.addEventListener(LIBRARY_EVENT, load);
+    return () => {
+      live = false;
+      window.removeEventListener(LIBRARY_EVENT, load);
+    };
+  }, []);
+  return films;
+}
+
+/** Looks for new films and fetches any missing posters. */
+function RefreshButton() {
+  const [busy, setBusy] = useState(false);
+  return (
+    <button
+      type="button"
+      title={busy ? "Looking for new films and posters…" : "Refresh: find new films and fetch missing posters"}
+      disabled={busy}
+      onClick={() => {
+        setBusy(true);
+        void refreshLibrary().finally(() => setBusy(false));
+      }}
+      className="flex size-8 shrink-0 items-center justify-center rounded-full text-cream/60 transition-colors hover:bg-cream/10 hover:text-cream disabled:text-accent"
+    >
+      <svg viewBox="0 0 16 16" aria-hidden className={cn("size-4", busy && "animate-spin")}>
+        <path d="M13.5 8a5.5 5.5 0 1 1-1.6-3.9" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" />
+        <path d="M12.6 1.6v3.1H9.5" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" />
+      </svg>
+    </button>
+  );
+}
+
+// The 3D store pulls in three.js, so it only loads when the 3D Store mode is opened.
+const VideoStore = lazy(() => import("./store3d").then((m) => ({ default: m.VideoStore })));
+
+/** Streaming, or with `store` the 3D video store: the same title pages, player and search. */
+export function StreamingView({ onMode, store = false }: { onMode: (mode: AppMode) => void; store?: boolean }) {
   const { movies, shows } = useLibrary();
+  const home = useHomeVideos();
   const missing = useMissing(movies);
   const [wantOpen, setWantOpen] = useState(false);
   const [look, setLook] = useState<Look>(() => {
@@ -122,9 +218,13 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
   useEffect(() => durable.setItem("parlor.playIntro", introOn ? "1" : "0"), [introOn]);
   const [intro, setIntro] = useState<{ kind: IntroKind; src: string | null; title: string; start: () => void } | null>(null);
 
-  function play(film: Film, fromMs = resumeMs(film.id)) {
-    const start = () => setPlaying((before) => ({ film, fromMs, session: (before?.session ?? 0) + 1 }));
-    if (!introOn || intro) return start();
+  /** `quiet` skips the opening animation (the 3D store plays its own). */
+  function play(film: Film, fromMs = resumeMs(film.id), quiet = false) {
+    const start = () => {
+      setPlaying((before) => ({ film, fromMs, session: (before?.session ?? 0) + 1 }));
+      setClock({ id: film.id, paused: false, at: serverNow() - fromMs });
+    };
+    if (quiet || !introOn || intro) return start();
     // From a title page its backdrop is already showing; from the rows the backdrop opens up.
     const show = showOf(film);
     setIntro({
@@ -137,16 +237,60 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
 
   const showOf = (film: Film) => shows.find((show) => show.episodes.includes(film));
 
+  // Complete Sync: the title page that is open, and the film playing (and where), are the same on every screen.
+  const [syncOn] = useCompleteSync();
+  const [clock, setClock] = useState<Clock>(null);
+  const [remoteClock, setRemoteClock] = useState(0);
+  const playingRef = useRef(playing);
+  playingRef.current = playing;
+  useShared<Clock>("stream.play", clock, (theirs) => {
+    setClock(theirs);
+    if (!theirs) return setPlaying(null);
+    const film = CATALOG.find((item) => item.id === theirs.id) ?? home.find((item) => item.id === theirs.id);
+    if (!film) return;
+    setIntro(null);
+    const pos = theirs.paused ? theirs.at : serverNow() - theirs.at;
+    if (playingRef.current?.film.id !== theirs.id) setPlaying((before) => ({ film, fromMs: Math.max(0, pos), session: (before?.session ?? 0) + 1 }));
+    setRemoteClock((value) => value + 1);
+  });
+  type PickKey = { kind: Pick["kind"]; id: string } | null;
+  const pickKey: PickKey =
+    pick == null
+      ? null
+      : pick.kind === "film"
+        ? { kind: "film", id: pick.film.id }
+        : pick.kind === "show"
+          ? { kind: "show", id: pick.show.name }
+          : pick.kind === "collection"
+            ? { kind: "collection", id: pick.name }
+            : { kind: "gap", id: pick.gap.id };
+  useShared<PickKey>("stream.pick", pickKey, (theirs) => {
+    if (!theirs) return setPick(null);
+    if (theirs.kind === "film") {
+      const film = movies.find((item) => item.id === theirs.id) ?? CATALOG.find((item) => item.id === theirs.id) ?? home.find((item) => item.id === theirs.id);
+      if (film) setPick({ kind: "film", film });
+    } else if (theirs.kind === "show") {
+      const show = shows.find((item) => item.name === theirs.id);
+      if (show) setPick({ kind: "show", show });
+    } else if (theirs.kind === "collection") {
+      const films = movies.filter((item) => item.collection === theirs.id);
+      if (films.length) setPick({ kind: "collection", name: theirs.id, films });
+    } else {
+      const gap = missing.all.find((item) => item.id === theirs.id);
+      if (gap) setPick({ kind: "gap", gap });
+    }
+  });
+
   const searched = useMemo(() => {
     const words = query.trim().toLowerCase();
     if (!words) return null;
     const hit = (text: string) => text.toLowerCase().includes(words);
     return {
-      movies: movies.filter((film) => hit(film.title) || hit(film.director) || (film.collection != null && hit(film.collection))),
+      movies: [...home.filter((film) => hit(film.title)), ...movies.filter((film) => hit(film.title) || hit(film.director) || (film.collection != null && hit(film.collection)))],
       shows: shows.filter((show) => hit(show.name)),
       gaps: missing.all.filter((gap) => hit(gap.title) || (gap.collection != null && hit(gap.collection))),
     };
-  }, [query, movies, shows, missing.all]);
+  }, [query, movies, shows, missing.all, home]);
 
   const tileFor = (film: Film) => <Tile key={film.id} title={film.title} sub={film.year ? String(film.year) : ""} poster={film.poster} film={film} retro={retro} onOpen={() => setPick({ kind: "film", film })} />;
   const gapTile = (gap: Gap) => <GapTile key={`gap:${gap.id}`} gap={gap} wanted={missing.wanted(gap.id)} retro={retro} onOpen={() => setPick({ kind: "gap", gap })} />;
@@ -158,7 +302,8 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
     <main className={cn("relative flex h-dvh flex-col overflow-hidden", retro && "font-display")}>
       <header className="z-20 flex shrink-0 flex-wrap items-center gap-3 border-b border-cream/10 bg-room/85 px-5 py-3 backdrop-blur">
         <p className={cn("text-lg font-semibold tracking-tight text-cream", retro && "tracking-widest uppercase")}>VayaView</p>
-        <ModeSwitch mode="streaming" onMode={onMode} />
+        <ModeSwitch mode={store ? "store" : "streaming"} onMode={onMode} />
+        {isRemote ? null : <RefreshButton />}
         <input
           value={query}
           onChange={(event) => setQuery(event.target.value)}
@@ -177,7 +322,7 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
         <button type="button" className={buttonClass} onClick={() => setWantOpen(true)}>
           ★ Want list{missing.want.length ? ` · ${missing.want.length}` : ""}
         </button>
-        <div className="relative">
+        <div className={cn("relative", store && "hidden")}>
           <button type="button" className={buttonClass} onClick={() => setLookOpen((open) => !open)}>
             Look · {LOOKS.find((item) => item.id === look)?.label} ▾
           </button>
@@ -208,7 +353,7 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
 
       <div className="relative min-h-0 flex-1 overflow-y-auto" key={watchTick}>
         {retro ? <Scanlines /> : null}
-        {movies.length === 0 && shows.length === 0 ? (
+        {movies.length === 0 && shows.length === 0 && home.length === 0 ? (
           <p className="p-10 text-cream/60">No films found yet. Pick your library folder in TV Guide → Settings.</p>
         ) : searched ? (
           <Grid label={`Results for “${query.trim()}”`} retro={retro}>
@@ -217,10 +362,14 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
             {missing.show ? searched.gaps.map(gapTile) : null}
             {searched.shows.length + searched.movies.length === 0 ? <p className="text-cream/50">Nothing matches.</p> : null}
           </Grid>
+        ) : store ? (
+          <Suspense fallback={<p className="p-10 text-cream/60">Opening the store…</p>}>
+            <VideoStore movies={movies} shows={shows} paused={pick != null || playing != null || wantOpen} onPlay={(film) => play(film, resumeMs(film.id), true)} />
+          </Suspense>
         ) : look === "wall" ? (
-          <Wall movies={movies} shows={shows} tileFor={tileFor} showTile={showTile} gaps={missing.show ? missing.all : []} gapTile={gapTile} />
+          <Wall home={home} movies={movies} shows={shows} tileFor={tileFor} showTile={showTile} gaps={missing.show ? missing.all : []} gapTile={gapTile} />
         ) : (
-          <Rows missing={missing} gapTile={gapTile} movies={movies} shows={shows} retro={retro} tileFor={tileFor} showTile={showTile} showOf={showOf} onPick={setPick} onPlay={play} />
+          <Rows home={home} missing={missing} gapTile={gapTile} movies={movies} shows={shows} retro={retro} tileFor={tileFor} showTile={showTile} showOf={showOf} onPick={setPick} onPlay={play} />
         )}
       </div>
 
@@ -235,6 +384,9 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
         <Player
           playing={playing}
           setPlaying={setPlaying}
+          shared={syncOn ? clock : null}
+          remoteClock={remoteClock}
+          onClock={setClock}
           nextOf={(film) => {
             const show = showOf(film);
             if (!show) return null;
@@ -242,6 +394,7 @@ export function StreamingView({ onMode }: { onMode: (mode: AppMode) => void }) {
           }}
           onClose={() => {
             setPlaying(null);
+            setClock(null);
             setWatchTick((value) => value + 1);
           }}
         />
@@ -447,6 +600,7 @@ function Grid({ label, children, retro }: { label: string; children: ReactNode; 
 }
 
 function Rows(props: {
+  home: Film[];
   missing: Missing;
   gapTile: (gap: Gap) => ReactNode;
   movies: Film[];
@@ -458,9 +612,9 @@ function Rows(props: {
   onPick: (pick: Pick) => void;
   onPlay: (film: Film) => void;
 }) {
-  const { missing, gapTile, movies, shows, retro, tileFor, showTile, showOf, onPick, onPlay } = props;
+  const { home, missing, gapTile, movies, shows, retro, tileFor, showTile, showOf, onPick, onPlay } = props;
   const rows = useMemo(() => {
-    const byId = new Map([...movies, ...shows.flatMap((show) => show.episodes)].map((film) => [film.id, film]));
+    const byId = new Map([...movies, ...home, ...shows.flatMap((show) => show.episodes)].map((film) => [film.id, film]));
     const watching = Object.entries(watchAll())
       .filter(([, entry]) => entry.ms > 0)
       .sort((a, b) => b[1].at - a[1].at)
@@ -479,7 +633,7 @@ function Rows(props: {
     const featured = movies.filter((film) => film.backdrop && (film.rating ?? 0) >= 6.5);
     const hero = featured.length ? featured.sort((a, b) => dayHash(a.id) - dayHash(b.id)).slice(0, 6) : [];
     return { watching, recent, recentShows, topRated, franchises, genres, hero };
-  }, [movies, shows]);
+  }, [movies, shows, home]);
 
   return (
     <div className="pb-10">
@@ -496,6 +650,7 @@ function Rows(props: {
           })}
         </Row>
       ) : null}
+      {home.length ? <Row label="Home videos" retro={retro}>{home.map(tileFor)}</Row> : null}
       {rows.recent.length ? <Row label="Recently added" retro={retro}>{rows.recent.map(tileFor)}</Row> : null}
       {missing.show && missing.want.length ? <Row label="Your want list" retro={retro}>{missing.want.map(gapTile)}</Row> : null}
       {missing.show && missing.franchise.length ? <Row label="Missing from your franchises" retro={retro}>{missing.franchise.map(gapTile)}</Row> : null}
@@ -569,26 +724,26 @@ function Hero({ films, retro, onPick, onPlay }: { films: Film[]; retro: boolean;
 
 type Sort = "az" | "added" | "year" | "rating";
 type WallItem = { film: Film; gap?: undefined } | { gap: Gap; film?: undefined };
-function Wall({ movies, shows, tileFor, showTile, gaps, gapTile }: { movies: Film[]; shows: Show[]; tileFor: (film: Film) => ReactNode; showTile: (show: Show) => ReactNode; gaps: Gap[]; gapTile: (gap: Gap) => ReactNode }) {
+function Wall({ home, movies, shows, tileFor, showTile, gaps, gapTile }: { home: Film[]; movies: Film[]; shows: Show[]; tileFor: (film: Film) => ReactNode; showTile: (show: Show) => ReactNode; gaps: Gap[]; gapTile: (gap: Gap) => ReactNode }) {
   const [genre, setGenre] = useState<string>("All");
   const [sort, setSort] = useState<Sort>(() => (durable.getItem("parlor.wallSort") as Sort | null) ?? "az");
   useEffect(() => durable.setItem("parlor.wallSort", sort), [sort]);
   const genres = useMemo(() => {
     const count = new Map<string, number>();
     for (const film of movies) for (const name of film.genres.slice(1)) count.set(name, (count.get(name) ?? 0) + 1);
-    return ["All", "TV shows", ...[...count].sort((a, b) => b[1] - a[1]).map(([name]) => name)];
-  }, [movies]);
+    return ["All", "TV shows", ...(home.length ? ["Home videos"] : []), ...[...count].sort((a, b) => b[1] - a[1]).map(([name]) => name)];
+  }, [movies, home.length]);
   const list = useMemo(() => {
     // Missing films (when shown) sit among the real ones, greyed out; "Recently added" puts them last.
     const pick = <T extends { genres: string[] }>(list: T[]) => (genre === "All" ? list : genre === "TV shows" ? [] : list.filter((item) => item.genres.includes(genre)));
-    const sorted: WallItem[] = [...pick(movies).map((film) => ({ film })), ...pick(gaps).map((gap) => ({ gap }))];
+    const sorted: WallItem[] = [...pick([...home, ...movies]).map((film) => ({ film })), ...pick(gaps).map((gap) => ({ gap }))];
     const of = (item: WallItem) => item.film ?? item.gap;
     if (sort === "az") sorted.sort((a, b) => of(a).title.localeCompare(of(b).title));
     if (sort === "added") sorted.sort((a, b) => (b.film?.addedMs ?? -1) - (a.film?.addedMs ?? -1));
     if (sort === "year") sorted.sort((a, b) => of(b).year - of(a).year);
     if (sort === "rating") sorted.sort((a, b) => (of(b).rating ?? 0) - (of(a).rating ?? 0));
     return sorted;
-  }, [movies, gaps, genre, sort]);
+  }, [movies, home, gaps, genre, sort]);
   const tiles = list.map((item) => (item.film ? tileFor(item.film) : gapTile(item.gap)));
   const showList = genre === "All" || genre === "TV shows" ? shows : [];
   return (
@@ -652,7 +807,26 @@ function clock(ms: number) {
  * channel there is no wall clock: the video is the clock. It only starts again
  * from a new spot when you skip somewhere not loaded yet.
  */
-function Player({ playing, setPlaying, nextOf, onClose }: { playing: Playing; setPlaying: (next: Playing | null) => void; nextOf: (film: Film) => Film | null; onClose: () => void }) {
+function Player({
+  playing,
+  setPlaying,
+  nextOf,
+  onClose,
+  shared: sharedClock = null,
+  remoteClock = 0,
+  onClock,
+}: {
+  playing: Playing;
+  setPlaying: (next: Playing | null) => void;
+  nextOf: (film: Film) => Film | null;
+  onClose: () => void;
+  /** Complete Sync on: the shared timeline. */
+  shared?: Clock;
+  /** Bumped when another screen moved the shared timeline. */
+  remoteClock?: number;
+  /** The viewer started, skipped or paused here: the new timeline. */
+  onClock?: (clock: Clock) => void;
+}) {
   const { film } = playing;
   const duration = film.durationMs;
   // Where the stream was asked to start. Changes only on a skip.
@@ -711,6 +885,7 @@ function Player({ playing, setPlaying, nextOf, onClose }: { playing: Playing; se
     if (next) {
       clearPosition(next.id);
       setPlaying({ film: next, fromMs: 0, session: playing.session + 1 });
+      onClock?.({ id: next.id, paused: false, at: serverNow() });
     } else onClose();
   }
 
@@ -718,10 +893,11 @@ function Player({ playing, setPlaying, nextOf, onClose }: { playing: Playing; se
   const seekTimer = useRef<number | null>(null);
   const holdPos = useRef<{ streamed: boolean; until: number } | null>(null);
   useEffect(() => () => void (seekTimer.current != null && window.clearTimeout(seekTimer.current)), []);
-  function seek(ms: number) {
+  function seek(ms: number, share = true) {
     const at = Math.min(Math.max(0, ms), duration - 3000);
     setPos(at);
     setPaused(false);
+    if (share) onClock?.({ id: film.id, paused: false, at: serverNow() - at });
     holdPos.current = { streamed: false, until: Date.now() + 8000 };
     if (seekTimer.current != null) window.clearTimeout(seekTimer.current);
     seekTimer.current = window.setTimeout(() => {
@@ -738,7 +914,37 @@ function Player({ playing, setPlaying, nextOf, onClose }: { playing: Playing; se
     holdPos.current = null;
     setPos(ms);
   };
-  const togglePause = () => setPaused((value) => !value);
+  const togglePause = () => {
+    const next = !pausedRef.current;
+    setPaused(next);
+    onClock?.(next ? { id: film.id, paused: true, at: posRef.current } : { id: film.id, paused: false, at: serverNow() - posRef.current });
+  };
+  const pausedRef = useRef(paused);
+  pausedRef.current = paused;
+
+  // Complete Sync: another screen skipped or paused: do the same here.
+  const clockRef = useRef(sharedClock);
+  clockRef.current = sharedClock;
+  useEffect(() => {
+    const shared = clockRef.current;
+    if (!remoteClock || !shared || shared.id !== film.id) return;
+    const target = shared.paused ? shared.at : serverNow() - shared.at;
+    if (Math.abs(posRef.current - target) > 1500) seek(target, false);
+    setPaused(shared.paused);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when another screen moved it
+  }, [remoteClock]);
+  // And if this screen falls well behind or ahead (a stall), skip level again; small gaps are evened out by speed.
+  useEffect(() => {
+    if (!sharedClock || sharedClock.paused || sharedClock.id !== film.id) return;
+    const timer = window.setInterval(() => {
+      const shared = clockRef.current;
+      if (!shared || shared.paused || holdPos.current) return;
+      const target = serverNow() - shared.at;
+      if (Math.abs(posRef.current - target) > 5000) seek(target, false);
+    }, 2000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- seek reads refs
+  }, [sharedClock?.id, sharedClock?.paused, sharedClock?.at, film.id]);
 
   const keys = useRef({ seek, togglePause, pos, close });
   keys.current = { seek, togglePause, pos, close };
@@ -750,12 +956,12 @@ function Player({ playing, setPlaying, nextOf, onClose }: { playing: Playing; se
       if (target instanceof HTMLInputElement && event.key.startsWith("Arrow")) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
       const k = keys.current;
-      if (event.key === " " || event.key === "k") {
+      if (event.key === " " || event.key === "k" || event.key === "MediaPlayPause") {
         event.preventDefault();
         k.togglePause();
       }
-      if (event.key === "ArrowLeft") k.seek(k.pos - 10_000);
-      if (event.key === "ArrowRight") k.seek(k.pos + 10_000);
+      if (event.key === "ArrowLeft" || event.key === "MediaRewind") k.seek(k.pos - 10_000);
+      if (event.key === "ArrowRight" || event.key === "MediaFastForward") k.seek(k.pos + 10_000);
       if (event.key === "Escape" && !document.fullscreenElement) {
         event.stopImmediatePropagation();
         k.close();
@@ -794,7 +1000,7 @@ function Player({ playing, setPlaying, nextOf, onClose }: { playing: Playing; se
         compact={false}
         seekToken={seekToken}
         paused={paused}
-        onDemand={{ onTime, onStream: () => void (holdPos.current && (holdPos.current.streamed = true)), onTogglePause: togglePause, onEnded: finish }}
+        onDemand={{ targetMs: () => (clockRef.current && !clockRef.current.paused && clockRef.current.id === film.id ? serverNow() - clockRef.current.at : null), onTime, onStream: () => void (holdPos.current && (holdPos.current.streamed = true)), onTogglePause: togglePause, onEnded: finish }}
         onToggleView={() => {
           if (document.fullscreenElement) void document.exitFullscreen();
           else void document.documentElement.requestFullscreen();

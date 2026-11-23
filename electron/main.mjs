@@ -432,6 +432,11 @@ if (!app.requestSingleInstanceLock()) {
       webPreferences: { autoplayPolicy: "no-user-gesture-required" },
     });
     win.on("closed", () => (win = null));
+    // Links that open a new window (Spotify sign-in, the Spotify dashboard) go to the user's browser.
+    win.webContents.setWindowOpenHandler(({ url }) => {
+      if (/^https?:/.test(url)) void shell.openExternal(url);
+      return { action: "deny" };
+    });
     // What a taskbar pin records: this id, this exe to relaunch, and this icon.
     if (app.isPackaged && WIN) {
       win.setAppDetails({
@@ -445,6 +450,12 @@ if (!app.requestSingleInstanceLock()) {
     // A stations backup asks where to go, starting in the backups folder.
     win.webContents.session.on("will-download", (_event, item) => {
       item.setSaveDialogOptions({ title: "Save stations backup", defaultPath: path.join(DATA_DIR, "backups", item.getFilename()) });
+    });
+    // Esc doesn't count as a click to the browser, so a page can't take the mouse back for walking
+    // after Esc. The 3D store asks for it here, with the app's say-so.
+    win.webContents.on("before-input-event", (_event, input) => {
+      if (input.type !== "keyUp" || input.key !== "Escape") return;
+      setTimeout(() => win?.webContents.executeJavaScript("window.__vvRelock?.()", true).catch(() => {}), 40);
     });
     await win.loadURL(`http://127.0.0.1:${PORT}/`);
   });

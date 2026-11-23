@@ -8,17 +8,20 @@ export function LibraryBar() {
   const [error, setError] = useState<string | null>(libraryInfo.error);
 
   const mac = libraryInfo.platform === "darwin";
+  // In Music mode this is the music folder, saved on its own; the film folders are not touched.
+  const music = libraryInfo.source === "music";
 
   /** The system's folder chooser. The chosen folder is added to the list; Scan saves it. */
   async function choose() {
     const response = await fetch("/api/pick-folder", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ title: "Choose a library folder" }),
+      body: JSON.stringify({ title: music ? "Choose your music videos folder" : "Choose a library folder" }),
     }).catch(() => null);
     const body = (await response?.json().catch(() => null)) as { path?: string | null } | null;
     const picked = body?.path;
-    if (picked) setValue((old) => [...old.split(";").map((item) => item.trim()).filter(Boolean), picked].join("; "));
+    if (picked && music) setValue(picked);
+    else if (picked) setValue((old) => [...old.split(";").map((item) => item.trim()).filter(Boolean), picked].join("; "));
   }
 
   async function save(event: FormEvent) {
@@ -29,10 +32,10 @@ export function LibraryBar() {
       .split(";")
       .map((item) => item.trim().replace(/^"|"$/g, ""))
       .filter(Boolean);
-    const response = await fetch("/api/config", {
+    const response = await fetch(music ? "/api/music/folder" : "/api/config", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ folders }),
+      body: JSON.stringify(music ? { folder: folders[0] ?? "" } : { folders }),
     });
     if (!response.ok) {
       const body = (await response.json().catch(() => null)) as { error?: string } | null;
@@ -48,7 +51,7 @@ export function LibraryBar() {
       ? "ffmpeg is not installed, so files cannot be measured or played. Open Terminal, run: brew install ffmpeg, then restart VayaView."
       : "ffprobe was not found, so files cannot be measured."
     : isDiskLibrary()
-      ? `${CATALOG.length} files on the schedule${diskMissingIds.size > 0 ? ` · ${diskMissingIds.size} not on disk` : ""}`
+      ? `${CATALOG.length} ${music ? "music videos" : "files"} on the schedule${diskMissingIds.size > 0 ? ` · ${diskMissingIds.size} not on disk` : ""}`
       : libraryInfo.folders.length > 0
         ? "No video files found there. Showing the demo catalog."
         : "Demo catalog. Paste a folder of videos to air your own.";
@@ -59,7 +62,7 @@ export function LibraryBar() {
         <input
           value={value}
           onChange={(event) => setValue(event.target.value)}
-          placeholder={`Library folder, for example ${mac ? "~/Movies or /Volumes/Drive/Movies" : "D:\\Movies"}  (separate several with ;)`}
+          placeholder={music ? "Music videos folder, for example G:\\MUSIC" : `Library folder, for example ${mac ? "~/Movies or /Volumes/Drive/Movies" : "D:\\Movies"}  (separate several with ;)`}
           aria-label="Library folders"
           className="min-w-0 flex-1 rounded-md bg-screen px-3 py-1.5 text-xs text-cream placeholder:text-cream/30 focus:outline-1 focus:outline-accent"
         />

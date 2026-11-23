@@ -6,6 +6,8 @@ import { durable } from "../durable.ts";
 
 /** The demo stations and the user's own stations never share a save. */
 function storageKey(): string {
+  // Music stations are saved apart from the film stations, so the two can never mix.
+  if (libraryInfo.source === "music") return `${STORAGE_KEY}.music:${libraryInfo.folders.join("|")}`;
   return isDiskLibrary() ? `${STORAGE_KEY}.disk:${libraryInfo.folders.join("|")}` : STORAGE_KEY;
 }
 

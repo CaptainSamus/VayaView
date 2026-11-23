@@ -10,7 +10,7 @@ export type FontChoice = { main: FontPick; title: FontPick };
 
 const KEY = "parlor.fonts";
 const FALLBACK = 'ui-sans-serif, system-ui, sans-serif';
-const DEFAULT_STACK = `"Outfit", ${FALLBACK}`;
+const DEFAULT_STACK = `"Inter", ${FALLBACK}`;
 
 export function loadFonts(): FontChoice {
   try {

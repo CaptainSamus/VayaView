@@ -1,0 +1,98 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  html, body { margin: 0; height: 100%; background: #14100d; color: #f3e6cf; font-family: sans-serif; }
+  body { display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 18px; text-align: center; }
+  h1 { font-size: 44px; margin: 0; letter-spacing: -1px; }
+  p { margin: 0; font-size: 20px; opacity: 0.75; max-width: 760px; line-height: 1.4; }
+  .row { display: flex; gap: 12px; align-items: center; }
+  input { font-size: 24px; padding: 10px 14px; width: 320px; border-radius: 10px; border: 0; background: #2a221c; color: #f3e6cf; text-align: center; }
+  button { font-size: 22px; padding: 10px 22px; border-radius: 10px; border: 0; background: #2a221c; color: #f3e6cf; }
+  :focus { outline: 4px solid #f5b544; outline-offset: 3px; }
+  .spin { width: 34px; height: 34px; border: 4px solid #f3e6cf33; border-top-color: #f5b544; border-radius: 50%; animation: s 0.9s linear infinite; }
+  @keyframes s { to { transform: rotate(360deg); } }
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+  <h1>VayaView</h1>
+  <div class="spin" id="spin"></div>
+  <p id="msg">Looking for VayaView on your PC…</p>
+  <div id="manual" hidden>
+    <p style="margin-bottom: 14px">Or type the PC's address (Settings → Phone on the PC shows it):</p>
+    <div class="row">
+      <input id="addr" placeholder="192.168.1.20" inputmode="decimal" />
+      <button id="go">Connect</button>
+      <button id="again">Look again</button>
+    </div>
+  </div>
+<script>
+  const $ = (id) => document.getElementById(id);
+  const tv = window.VayaTV;
+  const lost = location.search.includes("lost");
+
+  // After a failure, keep knocking on the last PC every 10 s, so the TV comes back by itself once
+  // VayaView is opened on the PC (no one has to press Look again).
+  let retry = 0;
+  function fail(text) {
+    $("spin").hidden = true;
+    $("msg").textContent = text + " (Trying again by itself every few seconds.)";
+    $("manual").hidden = false;
+    if (document.activeElement !== $("addr")) $("again").focus();
+    const last = tv.saved();
+    if (last && !retry) {
+      retry = setInterval(() => {
+        if (document.activeElement === $("addr")) return; // someone is typing an address
+        if (tv.reach(last.replace(/^http:\/\//, "").replace(/\/$/, ""))) {
+          clearInterval(retry);
+          tv.open(last);
+        }
+      }, 10000);
+    }
+  }
+
+  window.found = (url) => {
+    if (url) return tv.open(url);
+    fail("VayaView wasn't found. On the PC, open VayaView and switch on Settings → Phone, then press Look again.");
+  };
+
+  function search() {
+    $("spin").hidden = false;
+    $("manual").hidden = true;
+    $("msg").textContent = "Looking for VayaView on your PC…";
+    tv.search();
+  }
+
+  $("again").onclick = search;
+  $("go").onclick = () => {
+    const host = $("addr").value.trim().replace(/^https?:\/\//, "").replace(/\/.*$/, "");
+    if (!host) return;
+    const withPort = host.includes(":") ? host : host + ":47817";
+    if (tv.reach(withPort)) tv.open("http://" + withPort + "/");
+    else fail("Nothing answered at " + withPort + ". Is VayaView open on the PC with Phone switched on?");
+  };
+  // Left and right move between the boxes; the arrows otherwise do nothing on this page.
+  document.addEventListener("keydown", (e) => {
+    const order = [$("addr"), $("go"), $("again")];
+    const i = order.indexOf(document.activeElement);
+    if (i < 0) return;
+    if (e.key === "ArrowRight" && i < order.length - 1 && (i > 0 || $("addr").selectionStart === $("addr").value.length)) { order[i + 1].focus(); e.preventDefault(); }
+    if (e.key === "ArrowLeft" && i > 0) { order[i - 1].focus(); e.preventDefault(); }
+  });
+
+  const saved = tv.saved();
+  if (saved) {
+    $("addr").value = saved.replace(/^http:\/\//, "").replace(/\/$/, "");
+    // The PC last used, straight away; if it has moved, look for it.
+    setTimeout(() => {
+      if (tv.reach(saved.replace(/^http:\/\//, "").replace(/\/$/, ""))) tv.open(saved);
+      else if (lost) fail("Lost the PC. Is VayaView still open there?");
+      else search();
+    }, lost ? 1500 : 50);
+  } else search();
+</script>
+</body>
+</html>

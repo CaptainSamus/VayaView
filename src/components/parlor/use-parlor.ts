@@ -1,3 +1,5 @@
+import { serverNow } from "@/lib/server-clock";
+import { useShared } from "@/lib/shared";
 import { useCallback, useEffect, useMemo, useReducer, useRef, useState } from "react";
 import { CATALOG, catalogById, diskMissingIds, libraryInfo } from "@/lib/library/catalog";
 import { loadDiskLibrary } from "@/lib/library/disk";
@@ -98,6 +100,11 @@ function describe(action: ParlorAction, state: ParlorState): string {
 }
 
 export function useParlor() {
+  // The library may have been swapped (Music ↔ TV) since the last time a guide was open.
+  useState(() => {
+    fillSchedule();
+    return 0;
+  });
   const [state, dispatch] = useReducer(parlorReducer, undefined, createFactoryState);
   const [ready, setReady] = useState(false);
   const [now, setNow] = useState<number | null>(null);
@@ -139,8 +146,8 @@ export function useParlor() {
     const saved = loadPersisted();
     if (saved) dispatch({ type: "replace", state: refreshDiskState(saved) });
     setReady(true);
-    setNow(Date.now());
-    const timer = window.setInterval(() => setNow(Date.now()), 1000);
+    setNow(serverNow());
+    const timer = window.setInterval(() => setNow(serverNow()), 1000);
     return () => window.clearInterval(timer);
   }, []);
 
@@ -199,6 +206,51 @@ export function useParlor() {
     apply(channels, hiddenIds, label);
   }
 
+  /**
+   * Skip to the next programme: the station's clock jumps ahead by what is left
+   * of this one, so the guide, the phone and every later song move with it.
+   */
+  const skip = useCallback(() => {
+    const current = stateRef.current;
+    const tuned = current.channels.find((item) => item.id === current.tunedId);
+    if (!tuned) return;
+    const on = onNow(tuned, scheduleLibrary, new Set([...current.missingIds, ...diskMissingIds]), serverNow());
+    if (!on) return;
+    if (libraryInfo.source === "music") {
+      const action = { type: "skip" as const, id: tuned.id, byMs: -(on.remainingMs + 20) };
+      dispatch(action);
+      setSharedSkip({ ...action, n: Math.random(), at: serverNow() });
+      return;
+    }
+    // TV: only for today. From midnight the station is back on its usual schedule.
+    const now = Date.now();
+    const midnight = new Date(now);
+    midnight.setHours(24, 0, 0, 0);
+    const action = { type: "skip-today" as const, id: tuned.id, byMs: -(on.remainingMs + 20), now, until: midnight.getTime() };
+    dispatch(action);
+    setSharedSkip({ ...action, n: Math.random(), at: serverNow() });
+    setNotice(`Skipped ${on.slot.title} · just for today`);
+  }, []);
+
+  // Complete Sync: the station, and skips. A skip is sent as the exact change (not "skip"), so every
+  // screen's schedule moves by the same amount and they stay in step to the frame.
+  type SkipShare =
+    | { type: "skip"; id: string; byMs: number; n: number; at?: number }
+    | { type: "skip-today"; id: string; byMs: number; now: number; until: number; n: number; at?: number }
+    | null;
+  const [sharedSkip, setSharedSkip] = useState<SkipShare>(null);
+  const source = libraryInfo.source === "music" ? "music" : "tv";
+  useShared<SkipShare>(`${source}.skip`, sharedSkip, (theirs) => {
+    if (!theirs) return;
+    // A skip is a one-off: only one that just happened counts (never an old one replayed after a reload).
+    const { n: _n, at, ...action } = theirs;
+    if (typeof at !== "number" || Math.abs(serverNow() - at) > 8000) return;
+    dispatch(action as ParlorAction);
+  }, { event: true });
+  useShared<string | null>(`${source}.channel`, state.tunedId ?? null, (id) => {
+    if (id && id !== stateRef.current.tunedId) dispatch({ type: "tune", id });
+  });
+
   useEffect(() => {
     const onKey = (event: KeyboardEvent) => {
       const target = event.target;
@@ -254,6 +306,7 @@ export function useParlor() {
       const target = event.target;
       if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return;
       if (event.metaKey || event.ctrlKey || event.altKey) return;
+      if (document.querySelector("[data-station-editor]")) return; // the party view's station editor has the keys
       if (event.key === "Escape") {
         setOverlay((value) => (value === "guide" ? "none" : "guide"));
         setDigits("");
@@ -267,6 +320,10 @@ export function useParlor() {
       if (event.key === "ArrowDown") {
         event.preventDefault();
         dispatch({ type: "step", dir: -1 });
+        return;
+      }
+      if (event.key === "n" || event.key === "N") {
+        skip();
         return;
       }
       if (event.key === "g" || event.key === "G") {
@@ -327,6 +384,7 @@ export function useParlor() {
       setDigits((value) => (value + digit).slice(0, 3));
     },
     commitDigits,
+    skip,
     tune(id: string) {
       dispatch({ type: "tune", id });
       setOverlay("none");

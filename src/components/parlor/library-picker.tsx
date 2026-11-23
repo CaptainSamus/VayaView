@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { CATALOG } from "@/lib/library/catalog";
+import { CATALOG, libraryInfo } from "@/lib/library/catalog";
 import { searchLibrary } from "@/lib/library/match";
 import type { Film } from "@/lib/library/types";
 import { cn } from "@/lib/cn";
@@ -24,12 +24,36 @@ function seasonLabel(film: Film): string {
 const chip = "rounded-md px-2 py-1 text-xs";
 
 /**
+ * Music searches understand years: "1985", "1980-1989", "80s", "1990s", "2000 to 2005",
+ * on their own or with words ("80s rock", "madonna 90s").
+ */
+export function musicSearch(query: string): Film[] {
+  let from = 0;
+  let to = 0;
+  const rest = query
+    .replace(/\b(\d{4})\s*(?:-|–|to)\s*(\d{4})\b/i, (_, a, b) => ((from = Number(a)), (to = Number(b)), " "))
+    .replace(/\b(\d{2}|\d{4})'?s\b/i, (match, d) => {
+      if (from) return match;
+      const start = d.length === 2 ? (Number(d) < 30 ? 2000 : 1900) + Number(d) : Number(d);
+      from = start - (start % 10);
+      to = from + 9;
+      return " ";
+    })
+    .replace(/\b(19\d\d|20\d\d)\b/, (match, y) => (from ? match : ((from = to = Number(y)), " ")))
+    .trim();
+  const base = rest ? searchLibrary(CATALOG, rest).map((hit) => hit.entry) : from ? [...CATALOG] : [];
+  const list = from ? base.filter((film) => film.year >= Math.min(from, to) && film.year <= Math.max(from, to)) : base;
+  return from && !rest ? list.sort((a, b) => a.year - b.year || a.title.localeCompare(b.title)) : list;
+}
+
+/**
  * Search the library and take what you want: one film, every match, a whole
  * show, or a single season of it.
  */
 export function LibraryPicker({ exclude, verb, onPick, placeholder }: PickerProps) {
   const [query, setQuery] = useState("");
-  const hits = query.trim() ? searchLibrary(CATALOG, query).map((hit) => hit.entry) : [];
+  const music = libraryInfo.source === "music";
+  const hits = !query.trim() ? [] : music ? musicSearch(query) : searchLibrary(CATALOG, query).map((hit) => hit.entry);
   const fresh = (films: Film[]) => films.filter((film) => !exclude?.has(film.id)).map((film) => film.id);
 
   const shows = new Map<string, Group>();
@@ -100,7 +124,7 @@ export function LibraryPicker({ exclude, verb, onPick, placeholder }: PickerProp
         <div className="mt-2 rounded-lg bg-screen p-2">
           <div className="flex flex-wrap items-center gap-2">
             <span className="mr-auto text-sm">
-              {films.length} {films.length === 1 ? "film" : "films"}
+              {films.length} {music ? (films.length === 1 ? "song" : "songs") : films.length === 1 ? "film" : "films"}
             </span>
             {films.length > 1 ? button(films, `${verb} all`, query.trim()) : null}
           </div>

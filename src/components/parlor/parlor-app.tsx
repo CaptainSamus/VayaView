@@ -1,12 +1,31 @@
 import { useCallback, useEffect, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
+import { musicStartVolume, musicVolumeChanged } from "@/lib/music-volume";
 import { cn } from "@/lib/cn";
 import { formatDuration, formatStation, formatTime } from "@/lib/format";
 import type { Film } from "@/lib/library/types";
 import { playRequestFor } from "@/lib/player/seam";
 import type { Airing } from "@/lib/schedule/types";
 import { catalogById } from "@/lib/library/catalog";
-import { isRemote } from "@/lib/remote";
+import { onNow } from "@/lib/schedule/engine";
+import { isRemote, isTv } from "@/lib/remote";
+import { useShared } from "@/lib/shared";
+import { serverNow } from "@/lib/server-clock";
+
+/** A phone stacks the picture over the guide; a TV box keeps the PC layout. */
+const phoneLayout = isRemote && !isTv;
+
+/** On a TV, "Sync with PC" is remembered on the box itself (it cannot save settings on the PC). On by default. */
+const SYNC_KEY = "vv.tvSync";
+function loadSync(): boolean {
+  if (!isTv) return phoneLayout;
+  try {
+    return localStorage.getItem(SYNC_KEY) !== "0";
+  } catch {
+    return true;
+  }
+}
 import { GuideGrid } from "./guide-grid";
+import { TvControls } from "./tv-controls";
 import { Lineup } from "./lineup";
 import { Picture } from "./picture";
 import { SeekBar } from "./seek-bar";
@@ -34,7 +53,8 @@ type Held = { channelId: string; airing: Airing; film: Film; startMs: number };
  * above the listings. Full view is only the picture. G or a double click
  * switches. The player is the same element in both, so switching never reloads it.
  */
-export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
+/** `music`: the same guide, run on the music videos (Music mode). `onParty` switches to its full-screen look. */
+export function ParlorApp({ onMode, music = false, onParty }: { onMode?: (mode: AppMode) => void; music?: boolean; onParty?: () => void }) {
   const parlor = useParlor();
   const { state, channel, now } = parlor;
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -48,10 +68,15 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
       .catch(() => {});
   }, []);
   // On a phone: show what the PC is showing, until the phone picks a station of its own.
-  const [follow, setFollow] = useState(isRemote);
+  const [follow, setFollow] = useState(loadSync);
   const full = parlor.overlay === "none";
   const editing = parlor.overlay === "lineup";
   const toggleView = () => parlor.setOverlay(full ? "guide" : "none");
+  // A TV starts on the full picture; its Guide shows the PC-style guide with the picture in the corner.
+  useEffect(() => {
+    if (isTv) parlor.setOverlay("none");
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- once, on start
+  }, []);
 
   const [held, setHeld] = useState<Held | null>(null);
   const [menu, setMenu] = useState<{ id: string; x: number; y: number } | null>(null);
@@ -115,7 +140,8 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
   // The PC tells the house what it is showing. A following phone reads it every two seconds.
   const nowKey = `${state.tunedId}|${state.powered}|${held?.startMs ?? ""}|${held?.channelId ?? ""}`;
   useEffect(() => {
-    if (isRemote) return;
+    // Music stations are not on the phone, so a following phone keeps the film it has.
+    if (isRemote || music) return;
     void fetch("/api/now", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -128,6 +154,55 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- nowKey sums up everything sent
   }, [nowKey]);
 
+  // A synced TV that changes channel asks the PC to change too, so the two never play different things.
+  // The PC checks for such a request every second.
+  useEffect(() => {
+    if (isRemote || music) return;
+    let seen: number | null = null;
+    const check = async () => {
+      const request = (await fetch("/api/now/tune").then((response) => response.json()).catch(() => null)) as { channelId?: string; at?: number } | null;
+      if (!request) return;
+      if (seen == null) seen = request.at ?? 0;
+      else if (request.at && request.at > seen && request.channelId) {
+        seen = request.at;
+        parlor.dispatch({ type: "tune", id: request.channelId });
+      }
+    };
+    void check();
+    const timer = window.setInterval(check, 1000);
+    return () => window.clearInterval(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- parlor.dispatch is stable
+  }, [music]);
+
+  /** The channel the PC last put this TV on, and a channel this TV asked for that the PC has not reached yet. */
+  const fromPc = useRef<string | null>(null);
+  const asked = useRef<{ channelId: string; until: number } | null>(null);
+  useEffect(() => {
+    if (!isTv || !follow || !state.tunedId || state.tunedId === fromPc.current) return;
+    asked.current = { channelId: state.tunedId, until: Date.now() + 4000 };
+    void fetch("/api/now/tune", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ channelId: state.tunedId }) }).catch(() => {});
+  }, [state.tunedId, follow]);
+
+  // Once a station has settled, look up where the stations either side would start, so pressing up or
+  // down starts the new stream at once (the PC keeps the answers; see keyframeCache in parlor-api.mjs).
+  useEffect(() => {
+    if (!state.powered || !state.tunedId) return;
+    const timer = window.setTimeout(() => {
+      const list = state.channels.slice().sort((a, b) => a.number - b.number || a.name.localeCompare(b.name));
+      const index = list.findIndex((item) => item.id === state.tunedId);
+      if (index < 0 || list.length < 2) return;
+      for (const dir of [1, -1]) {
+        const next = list[(index + dir + list.length) % list.length];
+        const on = next ? onNow(next, scheduleLibrary, parlor.missing, serverNow()) : null;
+        if (!on || on.slot.status !== "ready" || !on.slot.mediaId) continue;
+        void fetch(`/api/keyframe/${on.slot.mediaId}?t=${(on.offsetMs / 1000).toFixed(2)}&warm=60`).catch(() => {});
+      }
+    }, 1200);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only on a new station
+  }, [state.tunedId, state.powered]);
+
+  const lastPcHeld = useRef<string | null>(null);
   const followRef = useRef({ tunedId: state.tunedId, held });
   followRef.current = { tunedId: state.tunedId, held };
   useEffect(() => {
@@ -139,7 +214,17 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
       } | null;
       if (!pc?.channelId) return;
       const mine = followRef.current;
+      // This TV just asked for a channel: wait for the PC to get there instead of snapping back.
+      const ask = asked.current;
+      if (ask && pc.channelId !== ask.channelId && Date.now() < ask.until) return;
+      asked.current = null;
+      fromPc.current = pc.channelId;
       if (pc.channelId !== mine.tunedId) parlor.dispatch({ type: "tune", id: pc.channelId });
+      // A TV only follows the PC's skips when the PC skips; its own pause/skips are not undone.
+      const pcHeldKey = pc.held ? `${pc.held.channelId}|${pc.held.startMs}` : "";
+      const pcSkipped = pcHeldKey !== lastPcHeld.current;
+      lastPcHeld.current = pcHeldKey;
+      if (isTv && !pcSkipped) return;
       const film = pc.held ? catalogById.get(pc.held.mediaId) : undefined;
       if (pc.held && film && pc.held.startMs !== mine.held?.startMs) {
         setHeld({ channelId: pc.held.channelId, airing: pc.held.airing, film, startMs: pc.held.startMs });
@@ -157,8 +242,35 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
   }, [follow]);
 
   function goLive() {
+    setPausedAt(null);
     setHeld(null);
     setSeekToken((value) => value + 1);
+  }
+
+  /** TV pause: remember where the picture stopped; Play carries on from there (behind live until Live is pressed). */
+  const [pausedAt, setPausedAt] = useState<number | null>(null);
+  const pauseKey = `${state.tunedId}|${airing?.slot.mediaId ?? ""}`;
+  useEffect(() => setPausedAt(null), [pauseKey]);
+  // Complete Sync: the station, and where in the programme (paused, skipped back), match on every screen.
+  type SharedTime = { held: { channelId: string; mediaId: string; startMs: number; airing: Airing } | null; pausedAt: number | null };
+  useShared<SharedTime>(
+    music ? "music.time" : "tv.time",
+    { held: held ? { channelId: held.channelId, mediaId: held.film.id, startMs: held.startMs, airing: held.airing } : null, pausedAt },
+    (theirs) => {
+      const film = theirs.held ? catalogById.get(theirs.held.mediaId) : undefined;
+      setHeld(theirs.held && film ? { channelId: theirs.held.channelId, airing: theirs.held.airing, film, startMs: theirs.held.startMs } : null);
+      setPausedAt(theirs.pausedAt);
+      setSeekToken((value) => value + 1);
+    },
+  );
+  function togglePause() {
+    if (pausedAt == null) {
+      if (airing) setPausedAt(airing.offsetMs);
+      return;
+    }
+    const at = pausedAt;
+    setPausedAt(null);
+    seekTo(at);
   }
 
   function seekTo(ms: number) {
@@ -166,7 +278,7 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
     const at = Math.min(Math.max(0, ms), airing.slot.durationMs - 5000);
     // Landing back on the clock is just being live again.
     if (sameProgramme && live && Math.abs(at - live.offsetMs) < 3000) return goLive();
-    setHeld({ channelId: channel.id, airing, film, startMs: Date.now() - at });
+    setHeld({ channelId: channel.id, airing, film, startMs: serverNow() - at });
     setSeekToken((value) => value + 1);
   }
 
@@ -217,6 +329,19 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
 
   // Back to the station you were on before this one. Backspace does the same.
   const lastChannel = state.lastId ? state.channels.find((item) => item.id === state.lastId) : undefined;
+  function toggleSync() {
+    setFollow((value) => {
+      if (isTv) {
+        try {
+          localStorage.setItem(SYNC_KEY, value ? "0" : "1");
+        } catch {
+          // Not remembered; it still holds until the app closes.
+        }
+      }
+      return !value;
+    });
+  }
+
   const lastButton = (
     <button
       type="button"
@@ -250,8 +375,8 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
       </p>
 
       <div
-        className={full ? "" : isRemote ? "flex shrink-0 flex-col gap-3" : "grid shrink-0 gap-3"}
-        style={full || isRemote ? undefined : { gridTemplateColumns: `minmax(0, ${split}%) minmax(0, 1fr)` }}
+        className={full ? "" : phoneLayout ? "flex shrink-0 flex-col gap-3" : "grid shrink-0 gap-3"}
+        style={full || phoneLayout ? undefined : { gridTemplateColumns: `minmax(0, ${split}%) minmax(0, 1fr)` }}
       >
         <div className={full ? "fixed inset-0 z-40 bg-black" : "group/picture relative aspect-video overflow-hidden rounded-screen"}>
           {full || isRemote ? null : (
@@ -265,6 +390,7 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
             />
           )}
           <Picture
+            ownVolume={music ? { start: musicStartVolume(), onChange: musicVolumeChanged } : undefined}
             powered={state.powered}
             channel={channel}
             airing={airing}
@@ -277,6 +403,7 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
             adjust={isRemote ? undefined : picture.value}
             compact={!full}
             seekToken={seekToken}
+            paused={pausedAt != null}
             onToggleView={toggleView}
             toolbar={
               <div className="flex items-start gap-3">
@@ -287,7 +414,7 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
                 </button>
               </div>
             }
-            footer={seekBar("rounded-lg bg-black/55 px-3 py-2")}
+            footer={seekBar("rounded-lg bg-black/30 px-3 py-2")}
           />
         </div>
 
@@ -298,7 +425,17 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
                 {channel ? `${channel.callSign} · ${channel.name}` : "VayaView"}
               </p>
               <div className="flex shrink-0 items-center gap-3">
-                {onMode ? <ModeSwitch mode="tv" onMode={onMode} /> : null}
+                {onMode ? <ModeSwitch mode={music ? "music" : "tv"} onMode={onMode} /> : null}
+                {state.powered && airing ? (
+                  <button
+                    type="button"
+                    className={buttonClass}
+                    onClick={parlor.skip}
+                    title={music ? "Skip to the next song (N)" : "Skip to the next programme, just for today. Tomorrow the station is back to its usual schedule. (N)"}
+                  >
+                    {music ? "Skip song" : "Skip"} ⏭
+                  </button>
+                ) : null}
                 <p className="text-sm text-cream/60 tabular-nums">{now != null ? formatTime(now) : ""}</p>
               </div>
             </div>
@@ -338,6 +475,12 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
 
             <div className="mt-auto pt-4">
               <div className="mt-2 flex flex-wrap items-center gap-2">
+                {/* Here, not in the top row: there it was pushed off the right edge by the mode tabs (user couldn't see it). */}
+                {music && onParty ? (
+                  <button type="button" className={primaryClass} onClick={onParty} title="Back to the station list beside the picture">
+                    ← Party view
+                  </button>
+                ) : null}
                 {lastButton}
                 <button type="button" className={primaryClass} onClick={toggleView}>
                   Full view
@@ -347,9 +490,9 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
                     type="button"
                     className={follow ? `${buttonClass} bg-accent text-room hover:bg-accent` : buttonClass}
                     aria-pressed={follow}
-                    onClick={() => setFollow((value) => !value)}
+                    onClick={toggleSync}
                   >
-                    {follow ? "● Following PC" : "Follow PC"}
+                    {isTv ? (follow ? "● Synced with PC" : "Sync with PC") : follow ? "● Following PC" : "Follow PC"}
                   </button>
                 ) : null}
                 {isRemote ? null : (
@@ -386,7 +529,7 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
       </div>
 
       {full || now == null ? null : settingsOpen ? (
-        <Settings className="flex-1" onClose={() => setSettingsOpen(false)} onRescan={rescan} scanLabel={scan} onRefresh={parlor.rescan} />
+        <Settings music={music} className="flex-1" onClose={() => setSettingsOpen(false)} onRescan={rescan} scanLabel={scan} onRefresh={parlor.rescan} />
       ) : editing ? (
         <Lineup
           className="flex-1"
@@ -409,14 +552,51 @@ export function ParlorApp({ onMode }: { onMode?: (mode: AppMode) => void }) {
           library={scheduleLibrary}
           onTune={(id) => {
             // Picking a station on the phone means it stops following the PC.
-            if (isRemote) setFollow(false);
+            // A synced TV stays synced: the PC changes with it.
+            if (phoneLayout) setFollow(false);
             parlor.dispatch({ type: "tune", id });
           }}
-          narrow={isRemote}
+          narrow={phoneLayout}
+          music={music}
           onFavorite={(id) => parlor.dispatch({ type: "favorite", id })}
           onMenu={openMenu}
         />
       )}
+
+      {isTv ? (
+        <TvControls
+          channel={channel}
+          airing={airing}
+          powered={state.powered}
+          tracks={tracks}
+          synced={follow}
+          onSync={toggleSync}
+          onSeek={(byMs) => {
+            setPausedAt(null);
+            seekRef.current.seekTo((pausedAt ?? seekRef.current.offset) + byMs);
+          }}
+          paused={pausedAt != null}
+          onPause={togglePause}
+          behindMs={pausedAt == null && shifted && sameProgramme ? behindMs : null}
+          onLive={goLive}
+          lastLabel={lastChannel ? `Last · ${formatStation(lastChannel.number)}` : null}
+          onLast={() => lastChannel && parlor.dispatch({ type: "tune", id: lastChannel.id })}
+          modes={
+            onMode
+              ? [
+                  ...(music && onParty ? [{ label: "Party view", go: onParty }] : []),
+                  ...(music ? [{ label: "Live TV", go: () => onMode("tv") }] : []),
+                  { label: "Streaming", go: () => onMode("streaming") },
+                  ...(music ? [] : [{ label: "Music", go: () => onMode("music") }]),
+                  { label: "Spotify", go: () => onMode("spotify") },
+                ]
+              : []
+          }
+          guideOpen={parlor.overlay === "guide"}
+          onGuide={(open) => parlor.setOverlay(open ? "guide" : "none")}
+          onStep={(dir) => parlor.dispatch({ type: "step", dir })}
+        />
+      ) : null}
 
       {menu && menuChannel ? (
         <StationMenu

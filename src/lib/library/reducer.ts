@@ -27,6 +27,10 @@ export type ParlorAction =
   | { type: "favorite"; id: string }
   /** Move a station's whole schedule later (positive) or earlier (negative), or start it from the top now. */
   | { type: "shift"; id: string; byMs: number }
+  /** Jump a station on to its next programme. Not an edit, so it stays out of undo. */
+  | { type: "skip"; id: string; byMs: number }
+  /** Skip, but only for today: from midnight the station plays its usual schedule again. */
+  | { type: "skip-today"; id: string; byMs: number; now: number; until: number }
   | { type: "restart"; id: string; now: number }
   /** Take a number that may be in use. The station holding it gets this one
   /** Replace a station's whole lineup, for adding things back. `label` names the edit for undo. */
@@ -68,7 +72,7 @@ export function parlorReducer(state: ParlorState, action: ParlorAction): ParlorS
         callSign: makeCallSign(action.name, state.channels.map((item) => item.callSign)),
         mode: action.mode,
         shuffleSeed: action.id,
-        anchorMs: action.now,
+        anchorMs: action.now, skipToday: undefined,
         mediaIds: action.mediaIds,
         query: action.query,
       };
@@ -87,7 +91,7 @@ export function parlorReducer(state: ParlorState, action: ParlorAction): ParlorS
       return {
         ...state,
         channels: state.channels.map((channel) =>
-          channel.id === action.id ? { ...channel, mode: action.mode, anchorMs: action.now } : channel,
+          channel.id === action.id ? { ...channel, mode: action.mode, anchorMs: action.now, skipToday: undefined } : channel,
         ),
       };
     case "rename": {
@@ -131,7 +135,7 @@ export function parlorReducer(state: ParlorState, action: ParlorAction): ParlorS
           return {
             ...channel,
             mediaIds: channel.mediaIds.filter((id) => id !== action.mediaId),
-            anchorMs: action.now,
+            anchorMs: action.now, skipToday: undefined,
             // A hand-trimmed built-in station keeps its lineup instead of being refilled from disk.
             ...(channel.id.startsWith("ch-auto-") ? { edited: true } : {}),
           };
@@ -152,7 +156,7 @@ export function parlorReducer(state: ParlorState, action: ParlorAction): ParlorS
             ? {
                 ...channel,
                 mediaIds: [...new Set(action.mediaIds)],
-                anchorMs: action.now,
+                anchorMs: action.now, skipToday: undefined,
                 ...(channel.id.startsWith("ch-auto-") ? { edited: true } : {}),
               }
             : channel,
@@ -179,14 +183,24 @@ export function parlorReducer(state: ParlorState, action: ParlorAction): ParlorS
       };
     }
     case "shift":
+    case "skip":
       return {
         ...state,
         channels: state.channels.map((channel) => (channel.id === action.id ? { ...channel, anchorMs: channel.anchorMs + action.byMs } : channel)),
       };
+    case "skip-today":
+      return {
+        ...state,
+        channels: state.channels.map((channel) => {
+          if (channel.id !== action.id) return channel;
+          const held = channel.skipToday && action.now < channel.skipToday.until ? channel.skipToday.byMs : 0;
+          return { ...channel, skipToday: { byMs: held + action.byMs, until: action.until } };
+        }),
+      };
     case "restart":
       return {
         ...state,
-        channels: state.channels.map((channel) => (channel.id === action.id ? { ...channel, anchorMs: action.now } : channel)),
+        channels: state.channels.map((channel) => (channel.id === action.id ? { ...channel, anchorMs: action.now, skipToday: undefined } : channel)),
       };
     case "favorite":
       return {

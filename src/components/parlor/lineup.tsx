@@ -12,6 +12,7 @@ import { cn } from "@/lib/cn";
 import { ColorInput } from "./color-input";
 import { EpisodeCheck } from "./episodes";
 import { LibraryPicker } from "./library-picker";
+import { StationBuilder } from "./station-builder";
 import type { Snapshot } from "./use-parlor";
 
 type LineupProps = {
@@ -267,17 +268,8 @@ export function Lineup({ state, dispatch, onClose, history, onUndo, onRestore, f
               }}
             />
           ) : (
-            <div className="max-w-3xl">
-              <p className="text-sm text-cream/70">New station</p>
-              <div className="mt-2 mb-3 flex flex-wrap items-center gap-2">
-                <button type="button" aria-pressed={mode === "loop"} className={pill(mode === "loop")} onClick={() => setMode("loop")}>
-                  In order
-                </button>
-                <button type="button" aria-pressed={mode === "shuffle"} className={pill(mode === "shuffle")} onClick={() => setMode("shuffle")}>
-                  Shuffle
-                </button>
-                <span className="text-xs text-cream/45">Search, then pick a whole show, one season, one film or every match.</span>
-              </div>
+            <div>
+              <p className="mb-2 text-sm text-cream/70">New station · pick what should be on it</p>
               {pending ? (
                 <div role="alert" className="mb-3 rounded-lg border border-accent/60 bg-accent/10 p-3 text-sm">
                   <p>
@@ -298,8 +290,21 @@ export function Lineup({ state, dispatch, onClose, history, onUndo, onRestore, f
                   </div>
                 </div>
               ) : null}
-              <LibraryPicker verb="Make a station of" onPick={(ids, label) => createChannel(ids, label)} placeholder="A show, a film, a genre, a director, or part of a name" />
+              <StationBuilder kind="new" order={mode} onOrder={setMode} onDone={(ids, name) => createChannel(ids, name)} />
+              <details className="mt-4 max-w-3xl rounded-xl bg-screen/40 p-3">
+              <summary className="cursor-pointer text-sm text-cream/70">Or search by name, or use a ready-made idea</summary>
+              <div className="mt-2 mb-3 flex flex-wrap items-center gap-2">
+                <button type="button" aria-pressed={mode === "loop"} className={pill(mode === "loop")} onClick={() => setMode("loop")}>
+                  In order
+                </button>
+                <button type="button" aria-pressed={mode === "shuffle"} className={pill(mode === "shuffle")} onClick={() => setMode("shuffle")}>
+                  Shuffle
+                </button>
+                <span className="text-xs text-cream/45">{libraryInfo.source === "music" ? "Search, then pick one song or every match, or tap a decade, genre or artist below." : "Search, then pick a whole show, one season, one film or every match."}</span>
+              </div>
+              <LibraryPicker verb="Make a station of" onPick={(ids, label) => createChannel(ids, label)} placeholder={libraryInfo.source === "music" ? "An artist, a song, a genre, a year (1985), years (1980-1989) or a decade (80s)" : "A show, a film, a genre, a director, or part of a name"} />
               <Suggestions onPick={(ids, label) => createChannel(ids, label)} />
+              </details>
             </div>
           )}
         </div>
@@ -318,6 +323,7 @@ type EditorProps = {
 };
 
 function StationEditor({ channel, state, dispatch, conflict, setConflict, onStep }: EditorProps) {
+  const [pictures, setPictures] = useState(false);
   const films = channel.mediaIds.map((id) => catalogById.get(id)).filter((film): film is Film => film != null);
   // A station that is one show, start to finish, can be checked for missing episodes.
   const first = films[0];
@@ -456,7 +462,24 @@ function StationEditor({ channel, state, dispatch, conflict, setConflict, onStep
         {oneShow ? <EpisodeCheck show={channel.name} films={films} /> : null}
 
         <div className="rounded-xl bg-screen/60 p-3">
-          <p className="mb-2 text-xs text-cream/55">Add to this station, or put back something you dropped</p>
+          <div className="mb-2 flex items-center gap-3">
+            <p className="text-xs text-cream/55">Add to this station, or put back something you dropped</p>
+            <button type="button" className="rounded-md bg-cream/10 px-2 py-1 text-xs text-cream hover:bg-cream/20" onClick={() => setPictures((on) => !on)}>
+              {pictures ? "Hide pictures" : "Add from pictures"}
+            </button>
+          </div>
+          {pictures ? (
+            <div className="mb-3">
+              <StationBuilder
+                kind="add"
+                exclude={new Set(channel.mediaIds)}
+                onDone={(ids, label) => {
+                  const merged = [...channel.mediaIds, ...ids];
+                  dispatch({ type: "set-media", id: channel.id, mediaIds: channel.mode === "loop" ? catalogOrder(merged) : merged, now: Date.now(), label: `Added ${label} to ${channel.name}` });
+                }}
+              />
+            </div>
+          ) : null}
           <LibraryPicker
             verb="Add"
             exclude={new Set(channel.mediaIds)}
@@ -507,6 +530,7 @@ function StationEditor({ channel, state, dispatch, conflict, setConflict, onStep
  * franchise with more than one. Nothing is made until one is clicked.
  */
 function Suggestions({ onPick }: { onPick: (ids: string[], label: string) => void }) {
+  if (libraryInfo.source === "music") return <MusicSuggestions onPick={onPick} />;
   const movies = CATALOG.filter((film) => film.genres[0] === "Movie");
   const genres = new Map<string, string[]>();
   const sets = new Map<string, string[]>();
@@ -546,6 +570,39 @@ function Suggestions({ onPick }: { onPick: (ids: string[], label: string) => voi
           </div>
         </div>
       ) : null}
+    </div>
+  );
+}
+/** One-click music stations: an artist, a genre or a decade, straight from the songs' details. */
+function MusicSuggestions({ onPick }: { onPick: (ids: string[], label: string) => void }) {
+  const groups = { artists: new Map<string, string[]>(), genres: new Map<string, string[]>(), decades: new Map<string, string[]>() };
+  const add = (map: Map<string, string[]>, key: string, id: string) => map.set(key, [...(map.get(key) ?? []), id]);
+  for (const song of CATALOG) {
+    if (song.collection) add(groups.artists, song.collection, song.id);
+    if (song.genres[1]) add(groups.genres, song.genres[1], song.id);
+    if (song.year) add(groups.decades, String(Math.floor(song.year / 10) * 10), song.id);
+  }
+  const chip = "rounded-md bg-cream/10 px-2 py-1 text-xs text-cream hover:bg-accent hover:text-room";
+  const section = (title: string, list: [string, string[]][], label: (key: string) => string) =>
+    list.length > 0 ? (
+      <div>
+        <p className="mb-1.5 text-xs text-cream/55">{title}</p>
+        <div className="flex max-h-40 flex-wrap gap-1.5 overflow-y-auto">
+          {list.map(([key, ids]) => (
+            <button key={key} type="button" className={chip} onClick={() => onPick(ids, label(key))}>
+              {label(key)} · {ids.length}
+            </button>
+          ))}
+        </div>
+      </div>
+    ) : null;
+  const decade = (key: string) => (Number(key) < 2000 ? `${key.slice(2)}s Music` : `${key}s Music`);
+  return (
+    <div className="mt-4 space-y-3">
+      {section("Decades", [...groups.decades].sort((a, b) => a[0].localeCompare(b[0])), decade)}
+      {section("Genres", [...groups.genres].filter(([, ids]) => ids.length >= 2).sort((a, b) => b[1].length - a[1].length), (key) => key)}
+      {section("Artists", [...groups.artists].filter(([, ids]) => ids.length >= 2).sort((a, b) => a[0].localeCompare(b[0])), (key) => key)}
+      <p className="text-[11px] text-cream/40">Genres and years come from Apple's music catalogue, looked up a few songs a minute in the background.</p>
     </div>
   );
 }

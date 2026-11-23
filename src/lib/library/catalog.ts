@@ -261,6 +261,8 @@ export const catalogById = new Map<string, Film>(CATALOG.map((film) => [film.id,
 export const diskMissingIds = new Set<string>();
 
 export const libraryInfo = {
+  /** Which library is loaded: the films (TV Guide, Streaming) or the music videos (Music). */
+  source: "tv" as "tv" | "music",
   folders: [] as string[],
   ffprobe: true,
   /** The system the app runs on ("win32", "darwin"), so help text can name the right steps. */

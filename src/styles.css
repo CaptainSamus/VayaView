@@ -6,10 +6,10 @@
   --color-screen: #070605;
   --color-cream: #f3eee6;
   --color-accent: #ff4d3a;
-  --font-sans: "Outfit", ui-sans-serif, system-ui, sans-serif;
-  --font-display: "Fraunces", Georgia, "Times New Roman", serif;
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Fraunces", Georgia, "Times New Roman", serif; /* Retro streaming look only */
   /* Big titles and station numbers. Changed in Settings > Fonts. */
-  --font-title: "Outfit", ui-sans-serif, system-ui, sans-serif;
+  --font-title: "Inter", ui-sans-serif, system-ui, sans-serif;
   --radius-set: 1.75rem;
   --radius-screen: 1rem;
 }
@@ -38,6 +38,8 @@
     /* The app fills the window. Only its panels scroll. */
     overflow: hidden;
     font-family: var(--font-sans);
+    font-feature-settings: "cv11", "ss01";
+    -webkit-font-smoothing: antialiased;
     text-wrap: pretty;
   }
 
@@ -45,8 +47,14 @@
   h2,
   h3 {
     text-wrap: balance;
-    font-family: var(--font-display);
+    font-family: var(--font-title);
+    letter-spacing: -0.015em;
   }
+}
+
+/* The Retro streaming look keeps its old serif headings. */
+.font-display :is(h1, h2, h3) {
+  font-family: var(--font-display);
 }
 
 ::selection {

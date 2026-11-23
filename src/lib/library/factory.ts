@@ -1,5 +1,5 @@
 import { searchLibrary } from "./match.ts";
-import { CATALOG, isDiskLibrary } from "./catalog.ts";
+import { CATALOG, isDiskLibrary, libraryInfo } from "./catalog.ts";
 import { makeCallSign } from "./naming.ts";
 import type { Channel } from "../schedule/types.ts";
 import type { ParlorState } from "./state.ts";
@@ -61,6 +61,28 @@ function createDiskState(): ParlorState {
     });
   };
   const ids = (films: typeof CATALOG) => films.map((entry) => entry.id);
+
+  // Music: everything shuffled, then a station per decade, genre and artist with three or more videos.
+  if (libraryInfo.source === "music") {
+    add("music-all", "All Music Videos", "shuffle", ids(CATALOG));
+    const groups = (key: (entry: (typeof CATALOG)[number]) => string | null) => {
+      const map = new Map<string, string[]>();
+      for (const entry of CATALOG) {
+        const name = key(entry);
+        if (name) map.set(name, [...(map.get(name) ?? []), entry.id]);
+      }
+      return [...map].filter(([, list]) => list.length >= 3);
+    };
+    const decade = (year: number) => (year >= 2000 ? `${Math.floor(year / 10) * 10}s` : `${String(Math.floor(year / 10) * 10).slice(2)}s`);
+    for (const [name, list] of groups((entry) => (entry.year ? String(Math.floor(entry.year / 10) * 10) : null)).sort((a, b) => Number(a[0]) - Number(b[0])))
+      add(`music-decade-${name}`, `${decade(Number(name))} Music`, "shuffle", list, 3);
+    for (const [name, list] of groups((entry) => entry.genres[1] ?? null).sort((a, b) => b[1].length - a[1].length))
+      add(`music-genre-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`, name, "shuffle", list, 3);
+    for (const [name, list] of groups((entry) => entry.collection).sort((a, b) => a[0].localeCompare(b[0])))
+      add(`music-artist-${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}`, name, "shuffle", list, 3);
+    channels.forEach((channel, i) => (channel.number = i + 1));
+    return { channels, missingIds: [], tunedId: channels[0]?.id ?? "", lastId: null, powered: true };
+  }
 
   const movies = CATALOG.filter((entry) => entry.genres.includes("Movie"));
   const episodes = CATALOG.filter((entry) => entry.genres.includes("TV"));
@@ -159,6 +181,11 @@ export function refreshDiskState(saved: ParlorState): ParlorState {
 }
 
 export function createFactoryState(): ParlorState {
+  // Music starts with its ready-made stations (all, decades, genres, artists); edit them like any other.
+  if (isDiskLibrary() && libraryInfo.source === "music") {
+    const state = createDiskState();
+    if (state.channels.length) return state;
+  }
   // A brand-new library starts with one station that plays everything, nothing more.
   // Every other station is one the user makes.
   if (isDiskLibrary()) {

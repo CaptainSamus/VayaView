@@ -17,3 +17,12 @@ Downloads/
 _old-icon-stuff/
 *.log
 .claude/
+tools/
+android/build/
+android/keystore/
+
+# Blender working files (big; the user keeps the originals on G:)
+blender/*.blend
+blender/*.blend1
+blender/*.glb
+/JakeTheDog01.glb

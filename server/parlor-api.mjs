@@ -19,6 +19,7 @@ import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { pipeline } from "node:stream";
+import { createSpotify } from "./spotify.mjs";
 
 const VIDEO_EXT = new Set([".mp4", ".m4v", ".mkv", ".mov", ".webm", ".avi", ".wmv", ".mpg", ".mpeg", ".m2ts", ".flv"]);
 const SUB_EXT = new Set([".srt", ".vtt", ".ass", ".ssa"]);
@@ -75,6 +76,83 @@ export function createParlorHandler(options = {}) {
 
   /** id -> entry, rebuilt on every scan. /media only serves what is in here. */
   let index = new Map();
+  /** The same for the music folder, which has its own scan, cache and channels. */
+  let musicIndex = new Map();
+  let homeIndex = new Map();
+  const mediaEntry = (id) => index.get(id) ?? musicIndex.get(id) ?? homeIndex.get(id);
+
+  // Still pictures from inside a video (music videos have no posters), for picking things by sight.
+  // Made once with ffmpeg, a few at a time, and kept in Data/thumb-cache.
+  const thumbDir = path.join(dataDir, "thumb-cache");
+  const thumbJobs = new Map();
+  let thumbRunning = 0;
+  const thumbQueue = [];
+  const makeThumb = (file, entry) =>
+    new Promise((resolve) => {
+      const run = () => {
+        thumbRunning++;
+        const at = Math.max(1, ((entry.durationMs ?? 60_000) / 1000) * 0.35);
+        const tmp = `${file}.${process.pid}.tmp.jpg`;
+        execFile(
+          FFMPEG,
+          ["-v", "error", "-y", "-ss", at.toFixed(1), "-i", entry.file, "-frames:v", "1", "-vf", "scale=360:-2", "-q:v", "5", tmp],
+          { timeout: 20_000, windowsHide: true },
+          (error) => {
+            thumbRunning--;
+            if (!error) {
+              try {
+                fs.renameSync(tmp, file);
+              } catch {
+                // another request finished it first
+              }
+            } else fs.rm(tmp, { force: true }, () => {});
+            resolve(!error);
+            thumbQueue.shift()?.();
+          },
+        );
+      };
+      if (thumbRunning < 3) run();
+      else thumbQueue.push(run);
+    });
+  async function sendThumb(res, id, entry) {
+    const file = path.join(thumbDir, `${crypto.createHash("sha1").update(id).digest("hex").slice(0, 16)}.jpg`);
+    if (!fs.existsSync(file)) {
+      fs.mkdirSync(thumbDir, { recursive: true });
+      if (!thumbJobs.has(file)) thumbJobs.set(file, makeThumb(file, entry).finally(() => thumbJobs.delete(file)));
+      await thumbJobs.get(file);
+    }
+    if (!fs.existsSync(file)) {
+      res.statusCode = 404;
+      return res.end();
+    }
+    res.setHeader("Content-Type", "image/jpeg");
+    res.setHeader("Cache-Control", "max-age=604800");
+    pipeline(fs.createReadStream(file), res, () => {});
+  }
+  const musicCacheFile = path.join(dataDir, "parlor-music-library.json");
+  const musicConfigFile = path.join(dataDir, "parlor-music.json");
+  const musicFolders = () => {
+    const folder = readJson(musicConfigFile, {}).folder ?? (process.platform === "win32" ? "G:\\MUSIC" : "");
+    return folder && fs.existsSync(folder) ? [folder] : [];
+  };
+  // Home videos: the user's own recordings, shown in Streaming as their own row (never on TV stations, no TMDB).
+  const homeCacheFile = path.join(dataDir, "parlor-home-library.json");
+  const homeConfigFile = path.join(dataDir, "parlor-home.json");
+  const homeFolders = () => {
+    const folder = readJson(homeConfigFile, {}).folder ?? (process.platform === "win32" ? "G:\\vids\\VayaView Recorded Media" : "");
+    return folder && fs.existsSync(folder) ? [folder] : [];
+  };
+  let homeScan = null;
+  let homeAt = 0;
+  async function homeLibrary(rescan) {
+    // Walk the folder again after a minute, so newly added recordings show up without a restart.
+    if (rescan || !homeScan || Date.now() - homeAt > 60_000) {
+      homeAt = Date.now();
+      homeScan = scan("home").catch((error) => ({ error: String(error), films: [], folders: [] }));
+    }
+    const result = await homeScan;
+    return { folder: result.folders?.[0] ?? homeFolders()[0] ?? null, films: result.films ?? [], error: result.error ?? null };
+  }
   let scanning = null;
   /** The last finished scan. A window (or phone) opening within ten minutes is handed this instead of a new walk of every folder. */
   let lastScan = null;
@@ -175,9 +253,12 @@ export function createParlorHandler(options = {}) {
       });
   }
 
-  async function scan() {
-    const roots = folders();
-    const cached = readJson(cacheFile, {});
+  /** Films by default; `music` (true) scans the music folder and "home" the home videos folder, each into its own cache and index. */
+  async function scan(music = false) {
+    const home = music === "home";
+    const roots = home ? homeFolders() : music ? musicFolders() : folders();
+    const cacheFile_ = home ? homeCacheFile : music ? musicCacheFile : cacheFile;
+    const cached = readJson(cacheFile_, {});
     const cache = cached.version === CACHE_VERSION ? (cached.files ?? {}) : {};
     const found = [];
     const subsByDir = new Map();
@@ -213,16 +294,35 @@ export function createParlorHandler(options = {}) {
       const info = await probe(item.file);
       status.done += 1;
       if (!info) return;
-      cache[item.file] = { root: item.root, size: item.size, mtimeMs: item.mtimeMs, ...info };
+      const kept = cache[item.file]?.id; // an id carried over from a move stays with the file
+      cache[item.file] = { root: item.root, size: item.size, mtimeMs: item.mtimeMs, ...info, ...(kept ? { id: kept } : {}) };
       // A long first scan survives the app being closed halfway.
-      if (++unsaved % 100 === 0) fs.writeFileSync(cacheFile, JSON.stringify({ version: CACHE_VERSION, files: cache }));
+      if (++unsaved % 100 === 0) fs.writeFileSync(cacheFile_, JSON.stringify({ version: CACHE_VERSION, files: cache }));
     });
 
     const videosInDir = new Map();
     for (const file of seen) videosInDir.set(path.dirname(file), (videosInDir.get(path.dirname(file)) ?? 0) + 1);
 
+    // A file moved to another folder or renamed keeps its id, so stations still play it.
+    // (Ids come from the path, so a move used to leave the station pointing at a gone file.)
+    // Matched by identical size and runtime; the new place has to be one without an id of its own yet.
+    const pathId = (file) => crypto.createHash("sha1").update(file.toLowerCase()).digest("hex").slice(0, 12);
+    const gone = Object.entries(cache).filter(([file, entry]) => !seen.has(file) && roots.includes(entry.root) && entry.size);
+    if (gone.length) {
+      const claimed = new Set();
+      for (const [oldFile, old] of gone) {
+        const match = Object.entries(cache).find(
+          ([file, entry]) => seen.has(file) && !entry.id && !claimed.has(file) && entry.size === old.size && entry.durationMs === old.durationMs,
+        );
+        if (!match) continue;
+        claimed.add(match[0]);
+        match[1].id = old.id ?? pathId(oldFile);
+        delete cache[oldFile];
+      }
+    }
+
     const films = [];
-    index = new Map();
+    const built = new Map();
     for (const [file, entry] of Object.entries(cache)) {
       if (!roots.includes(entry.root)) {
         delete cache[file];
@@ -230,13 +330,13 @@ export function createParlorHandler(options = {}) {
       }
       if (!entry.durationMs || !entry.vcodec) continue;
       const ext = path.extname(file).toLowerCase();
-      const id = crypto.createHash("sha1").update(file.toLowerCase()).digest("hex").slice(0, 12);
+      const id = entry.id ?? pathId(file);
       // A file that vanished keeps its slot and its runtime. The station does not skip.
       const missing = !seen.has(file);
       const first = entry.audio[0]?.codec;
       const direct = DIRECT_EXT.has(ext) && DIRECT_VIDEO.has(entry.vcodec) && (!first || DIRECT_AUDIO.has(first));
       const sidecars = missing ? [] : sidecarsFor(file, videosInDir, subsByDir);
-      index.set(id, { file, ext, vcodec: entry.vcodec, width: entry.width ?? 0, height: entry.height ?? 0, sidecars: sidecars.map((sub) => sub.file) });
+      built.set(id, { file, ext, vcodec: entry.vcodec, width: entry.width ?? 0, height: entry.height ?? 0, sidecars: sidecars.map((sub) => sub.file) });
       films.push({
         id,
         path: file,
@@ -257,10 +357,15 @@ export function createParlorHandler(options = {}) {
       });
     }
     films.sort((a, b) => a.path.localeCompare(b.path, undefined, { numeric: true }));
-    fs.writeFileSync(cacheFile, JSON.stringify({ version: CACHE_VERSION, files: cache }));
+    fs.writeFileSync(cacheFile_, JSON.stringify({ version: CACHE_VERSION, files: cache }));
     status.phase = "idle";
     const result = { folders: roots, films, ffprobe: ffprobeOk, platform: process.platform };
-    lastScan = { at: Date.now(), result };
+    if (home) homeIndex = built;
+    else if (music) musicIndex = built;
+    else {
+      index = built;
+      lastScan = { at: Date.now(), result };
+    }
     return result;
   }
 
@@ -323,6 +428,27 @@ export function createParlorHandler(options = {}) {
    * smaller first and the subtitle scaled by the same amount, so the overlay works on the small
    * frame instead of the 4K one; it lands exactly where it did before.
    */
+  /**
+   * HDR (PQ or HLG) pictures look grey and washed out once re-encoded to ordinary video, so the
+   * re-encode tones them down to normal colours. Asked once per file, remembered.
+   */
+  const hdrCache = new Map();
+  function isHdr(entry) {
+    if (!hdrCache.has(entry.file)) {
+      hdrCache.set(
+        entry.file,
+        new Promise((resolve) =>
+          execFile(FFPROBE, ["-v", "error", "-select_streams", "v:0", "-show_entries", "stream=color_transfer", "-of", "csv=p=0", entry.file], { timeout: 8000, windowsHide: true }, (error, out) =>
+            resolve(!error && /smpte2084|arib-std-b67/.test(String(out))),
+          ),
+        ),
+      );
+    }
+    return hdrCache.get(entry.file);
+  }
+  // Shrink first (cheap at 1080p), then tone-map: about 3x real time for 4K HDR on this PC.
+  const TONEMAP = "scale=-2:'min(1080,ih)',zscale=t=linear:npl=100,format=gbrpf32le,zscale=p=bt709,tonemap=tonemap=hable:desat=0,zscale=t=bt709:m=bt709:r=tv,format=yuv420p";
+
   function burnFilter(entry, burn) {
     if (!entry.width || !entry.height || entry.height <= 1080) return `[0:v:0][0:s:${burn}]overlay,scale=-2:'min(1080,ih)'[v]`;
     const factor = (1080 / entry.height).toFixed(6);
@@ -436,7 +562,7 @@ export function createParlorHandler(options = {}) {
     args.push("-map", `0:a:${audio}?`, "-sn");
     if (copy) args.push("-c:v", "copy", ...(entry.vcodec === "hevc" ? ["-tag:v", "hvc1"] : []));
     else {
-      if (burn == null) args.push("-vf", "scale=-2:'min(1080,ih)'");
+      if (burn == null) args.push("-vf", (await isHdr(entry)) ? TONEMAP : "scale=-2:'min(1080,ih)'");
       args.push(...encode);
     }
     // Half-second pieces: the player can start on the first one instead of waiting for a whole
@@ -597,28 +723,56 @@ export function createParlorHandler(options = {}) {
   }
 
   /** `near`: the closest keyframe either side (on-demand play, where the video is the clock). */
-  function sendKeyframe(res, entry, t, near = false) {
+  /**
+   * Keyframes already looked up, per file: { from, to, frames: [{ pts, delay }] }. The app asks ahead
+   * (`warm`) for the stations either side of the one playing, so a channel change finds its starting
+   * point here at once instead of waiting half a second for ffprobe.
+   */
+  const keyframeCache = new Map();
+  function pickKeyframe(frames, t, near) {
+    let best = null;
+    for (const frame of frames) {
+      if (near ? best != null && Math.abs(frame.pts - t) >= Math.abs(best.pts - t) : frame.pts > t || (best != null && frame.pts <= best.pts)) continue;
+      best = frame;
+    }
+    return best;
+  }
+  // `base` is the film time at the first instant of the stream: the keyframe, less its decode delay.
+  const keyframeAnswer = (best, t) => ({ found: best != null, t: best?.pts ?? t, base: Math.max(0, (best?.pts ?? t) - (best?.delay ?? 0)) });
+
+  function sendKeyframe(res, entry, t, near = false, warm = 0) {
+    const cached = keyframeCache.get(entry.file);
+    if (cached && !warm && t >= cached.from && (near ? t + 10 : t) <= cached.to) {
+      const best = pickKeyframe(cached.frames, t, near);
+      if (best) return sendJson(res, 200, keyframeAnswer(best, t));
+    }
+    const from = Math.max(0, t - 20);
+    const to = warm ? t + warm : near ? t + 10 : t;
     // Flipping past a station drops its question; ffprobe stops with it.
     const child = execFile(
       FFPROBE,
-      ["-v", "error", "-select_streams", "v:0", "-read_intervals", `${Math.max(0, t - 20)}%${near ? t + 10 : t}`, "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", entry.file],
-      { timeout: 8000, windowsHide: true, maxBuffer: 8 * 1024 * 1024 },
+      ["-v", "error", "-select_streams", "v:0", "-read_intervals", `${from}%${to}`, "-show_entries", "packet=pts_time,dts_time,flags", "-of", "csv=p=0", entry.file],
+      { timeout: 8000, windowsHide: true, maxBuffer: 16 * 1024 * 1024 },
       (error, stdout) => {
-        let best = null;
-        let delay = 0;
+        const frames = [];
         for (const line of String(stdout ?? "").split(/\r?\n/)) {
           const [pts, dts, flags] = line.split(",");
           const value = Number(pts);
           if (!flags?.includes("K") || !Number.isFinite(value)) continue;
-          if (near ? best != null && Math.abs(value - t) >= Math.abs(best - t) : value > t || (best != null && value <= best)) continue;
-          best = value;
-          delay = Number.isFinite(Number(dts)) ? Math.max(0, value - Number(dts)) : 0;
+          frames.push({ pts: value, delay: Number.isFinite(Number(dts)) ? Math.max(0, value - Number(dts)) : 0 });
         }
-        // `base` is the film time at the first instant of the stream: the keyframe, less its decode delay.
-        if (!res.destroyed) sendJson(res, 200, { found: best != null, t: best ?? t, base: Math.max(0, (best ?? t) - delay) });
+        if (!error && frames.length) {
+          keyframeCache.delete(entry.file);
+          keyframeCache.set(entry.file, { from, to, frames });
+          if (keyframeCache.size > 60) keyframeCache.delete(keyframeCache.keys().next().value);
+        }
+        if (res.destroyed) return;
+        if (warm) return sendJson(res, 200, { ok: frames.length > 0 });
+        sendJson(res, 200, keyframeAnswer(pickKeyframe(frames, t, near), t));
       },
     );
-    res.on("close", () => child.kill());
+    // A warm-up is allowed to finish even if the app stops waiting; a real question is dropped with its station.
+    if (!warm) res.on("close", () => child.kill());
   }
 
   /**
@@ -675,10 +829,10 @@ export function createParlorHandler(options = {}) {
   }
 
   /** The newest stations backup of any kind (hourly, on closing, or made by hand), as text. */
-  function newestBackup() {
+  function newestBackup(prefix = "stations ") {
     let newest = null;
     for (const name of fs.readdirSync(backupDir)) {
-      if (!name.startsWith("stations ") || !name.endsWith(".json")) continue;
+      if (!name.startsWith(prefix) || !name.endsWith(".json")) continue;
       const at = fs.statSync(path.join(backupDir, name)).mtimeMs;
       if (!newest || at > newest.at) newest = { name, at };
     }
@@ -686,6 +840,7 @@ export function createParlorHandler(options = {}) {
   }
   /** The hour already dealt with, so the backups folder is not read on every save. */
   let backupHour = "";
+  let musicBackupHour = "";
 
   function writeStore(key, value) {
     const file = storeFile(key);
@@ -693,16 +848,21 @@ export function createParlorHandler(options = {}) {
     // the same as the newest backup already there. The 72 newest hourly copies are kept; copies made on
     // closing are kept separately (30), and copies made by hand are never removed.
     const hour = new Date().toISOString().slice(0, 13).replace("T", " ");
-    if (key.startsWith("parlor.v2") && hour !== backupHour && fs.existsSync(file)) {
-      const copy = path.join(backupDir, `stations ${hour}h.json`);
+    // Music stations are backed up the same way, under "music-stations …", so a film backup is never loaded over them.
+    const isMusic = key.startsWith("parlor.v2.music");
+    const prefix = isMusic ? "music-stations " : "stations ";
+    if (key.startsWith("parlor.v2") && hour !== (isMusic ? musicBackupHour : backupHour) && fs.existsSync(file)) {
+      const copy = path.join(backupDir, `${prefix}${hour}h.json`);
       try {
         const before = JSON.parse(fs.readFileSync(file, "utf8")).value;
-        if (!fs.existsSync(copy) && before !== newestBackup()) {
+        if (!fs.existsSync(copy) && before !== newestBackup(prefix)) {
           fs.writeFileSync(copy, before);
-          const old = fs.readdirSync(backupDir).filter((name) => /^stations \d{4}-\d\d-\d\d \d\dh\.json$/.test(name)).sort().slice(0, -72);
+          const pattern = isMusic ? /^music-stations \d{4}-\d\d-\d\d \d\dh\.json$/ : /^stations \d{4}-\d\d-\d\d \d\dh\.json$/;
+          const old = fs.readdirSync(backupDir).filter((name) => pattern.test(name)).sort().slice(0, -72);
           for (const name of old) fs.rmSync(path.join(backupDir, name), { force: true });
         }
-        backupHour = hour;
+        if (isMusic) musicBackupHour = hour;
+        else backupHour = hour;
       } catch {
         // A missed hourly copy is not worth failing the save over.
       }
@@ -777,13 +937,13 @@ export function createParlorHandler(options = {}) {
     };
   }
 
-  async function runLookups(items) {
+  async function runLookups(items, retry = false) {
     const token = readJson(tmdbFile, {}).token;
     if (!token || tmdb.running) return;
     const meta = readJson(metaFile, {});
     // Version 2 added posters, backdrops and ratings. Older matches are fetched once more by id.
     const todo = items
-      .filter((item) => item?.key && item.title && (!meta[item.key] || (meta[item.key].found && (meta[item.key].v ?? 1) < META_VERSION)))
+      .filter((item) => item?.key && item.title && (!meta[item.key] || (retry && !meta[item.key].found) || (meta[item.key].found && (meta[item.key].v ?? 1) < META_VERSION)))
       .map((item) => (meta[item.key]?.found ? { ...item, tmdbId: meta[item.key].tmdbId } : item));
     if (todo.length === 0) return;
     Object.assign(tmdb, { running: true, done: 0, total: todo.length, error: null });
@@ -866,12 +1026,124 @@ export function createParlorHandler(options = {}) {
     catalogState.building = false;
   }
 
+  const artCache = new Map();
+
   async function searchFilms(query) {
     const token = readJson(tmdbFile, {}).token;
     if (!token) throw new Error("Add a TMDB token in TV Guide → Settings first.");
     const catalog = readJson(catalogFile, { genres: {} });
     const found = await tmdbGet(`/search/movie?query=${encodeURIComponent(query)}`, token);
     return (found.results ?? []).slice(0, 16).map((item) => partOf(item, catalog.genres ?? {}));
+  }
+
+  // ------------------------------------------------------------------ Music
+  // Artist and title come from the file name ("Artist - Title (Official Music Video)").
+  // The year and genre are looked up once on Apple's free iTunes search and kept in a file.
+  const musicMetaFile = path.join(dataDir, "parlor-music-meta.json");
+  const musicLookup = { running: false, done: 0, total: 0 };
+  let musicScan = null;
+
+  const JUNK = /\s*[([](?:[^)\]]*?(?:official|video|audio|lyric|visuali[sz]er|remaster|hd|hq|4k|1080p|720p|explicit|clean|mv|music)[^)\]]*)[)\]]/gi;
+  function parseMusicName(rel) {
+    const file = path.basename(rel, path.extname(rel));
+    const folder = path.basename(path.dirname(rel));
+    let name = file
+      .replace(/[-_ ]\d{3,4}x\d{3,4}.*$/i, "")
+      .replace(/_(?:1080|720|2160|480)p.*$/i, "")
+      .replace(/\s+-\s+HD Music Quality.*$/i, "")
+      .replace(/_/g, " ")
+      // Downloaders swap characters Windows won't allow in names: "AC⧸DC", "Paramore： crush", "NENA ｜ 99", "＂Crazy Train＂".
+      .replace(/[⧸∕／]/g, "/")
+      .replace(/[＂“”]/g, '"')
+      .replace(/\s*[：｜]\s*/, " - ")
+      .replace(/\s+[–—]\s+/, " - ")
+      .replace(/^(\S+(?: \S+)?)\s{2,}/, "$1 - "); // "LMFAO  Party Rock Anthem"
+    name = name.replace(JUNK, "").replace(JUNK, "");
+    // After the junk is gone, so "(Remastered 2014)" is not taken for the song's year.
+    const year = Number((/\b(19[5-9]\d|20[0-4]\d)\b/.exec(name) ?? [])[1]) || 0;
+    name = name.replace(/\b(19[5-9]\d|20[0-4]\d)\b\s*$/, "").replace(/\s{2,}/g, " ").trim();
+    const split = name.indexOf(" - ");
+    const artist = split > 0 ? name.slice(0, split).trim() : folder && folder !== "." ? folder : "";
+    const title = (split > 0 ? name.slice(split + 3) : name)
+      .replace(/\s*[[(](?:19|20)\d\d[\])]/g, "")
+      .replace(/^"(.*)"$/, "$1")
+      .trim();
+    return { artist, title, year };
+  }
+  /** The main act: "Lady Gaga, Bradley Cooper" and "X feat. Y" count as Lady Gaga and X. */
+  const leadArtist = (artist) => artist.split(/\s*(?:,|\bfeat\.?|\bft\.|\bfeaturing\b)\s*/i)[0].replace(/^the\s+/i, "The ").trim();
+  const musicKey = (artist, title) => `${artist}|${title}`.toLowerCase();
+
+  async function itunes(term, entity) {
+    const response = await fetch(`https://itunes.apple.com/search?media=music&entity=${entity}&limit=10&term=${encodeURIComponent(term)}`, { signal: AbortSignal.timeout(12_000) });
+    if (!response.ok) throw new Error(`iTunes answered ${response.status}`);
+    return (await response.json()).results ?? [];
+  }
+  async function lookUpSong(artist, title) {
+    const clean = title.replace(/\(.*?\)|\[.*?\]/g, "").replace(/\bfeat\..*$/i, "").trim();
+    const lead = leadArtist(artist).toLowerCase().replace(/^the /, "");
+    const results = [...(await itunes(`${leadArtist(artist)} ${clean}`, "song")), ...(await itunes(`${leadArtist(artist)} ${clean}`, "musicVideo"))];
+    // The same song by the same act: otherwise the earliest date could be another of their songs.
+    const flat = (text) => String(text ?? "").toLowerCase().replace(/\(.*?\)|\[.*?\]/g, "").replace(/[^a-z0-9]+/g, "");
+    const want = flat(clean);
+    const mine = results.filter(
+      (item) => String(item.artistName ?? "").toLowerCase().includes(lead.split(" ")[0]) && want && flat(item.trackName) && (flat(item.trackName).includes(want) || want.includes(flat(item.trackName))),
+    );
+    if (!mine.length) return { found: false, year: 0, genre: results[0]?.primaryGenreName ?? "" };
+    const pool_ = mine;
+    // The earliest release is the original; later dates are remasters and compilations.
+    const dates = pool_.map((item) => String(item.releaseDate ?? "").slice(0, 4)).map(Number).filter((y) => y > 1900);
+    const genres = pool_.map((item) => item.primaryGenreName).filter(Boolean);
+    const genre = genres.sort((a, b) => genres.filter((g) => g === b).length - genres.filter((g) => g === a).length)[0] ?? "";
+    return { found: dates.length > 0, year: dates.length ? Math.min(...dates) : 0, genre };
+  }
+  async function runMusicLookups(items) {
+    if (musicLookup.running) return;
+    const meta = readJson(musicMetaFile, {});
+    const todo = items.filter((item) => item.artist && !meta[musicKey(item.artist, item.title)]);
+    if (!todo.length) return;
+    Object.assign(musicLookup, { running: true, done: 0, total: todo.length });
+    // iTunes allows about 20 searches a minute, and each song takes two.
+    for (const item of todo) {
+      try {
+        meta[musicKey(item.artist, item.title)] = await lookUpSong(item.artist, item.title);
+      } catch {
+        // Offline or limited: tried again next time.
+      }
+      musicLookup.done += 1;
+      fs.writeFileSync(musicMetaFile, JSON.stringify(meta));
+      await new Promise((resolve) => setTimeout(resolve, 6500));
+    }
+    musicLookup.running = false;
+  }
+
+  async function musicLibrary(rescan) {
+    if (rescan || !musicScan) musicScan = scan(true).catch((error) => ({ error: String(error), films: [], folders: [] }));
+    const result = await musicScan;
+    const meta = readJson(musicMetaFile, {});
+    const videos = (result.films ?? []).map((film) => {
+      const name = parseMusicName(film.rel);
+      const found = meta[musicKey(name.artist, name.title)] ?? {};
+      return {
+        id: film.id,
+        rel: film.rel,
+        durationMs: film.durationMs,
+        direct: film.direct,
+        vcodec: film.vcodec,
+        height: film.height,
+        audio: film.audio,
+        missing: film.missing,
+        // A hand-filled artist (meta "artist") for files whose name has none ("Carry on Wayward Son.mkv").
+        artist: name.artist || found.artist || "",
+        lead: leadArtist(name.artist || found.artist || ""),
+        title: name.title,
+        // A year in the file name wins over the lookup.
+        year: name.year || found.year || 0, // a hand-corrected year is written over the lookup in the meta file
+        genre: found.genre ?? "",
+      };
+    });
+    void runMusicLookups(videos);
+    return { folder: result.folders?.[0] ?? null, videos, looking: musicLookup.running ? musicLookup.total - musicLookup.done : 0, error: result.error ?? null };
   }
 
   function tmdbStatus() {
@@ -892,7 +1164,7 @@ export function createParlorHandler(options = {}) {
   const PHONE_PORT = 47817;
   const newPin = () => String(crypto.randomInt(0, 1_000_000)).padStart(6, "0");
   function phoneConfig() {
-    const config = readJson(phoneFile, null) ?? { enabled: false, pin: newPin(), tokens: [] };
+    const config = readJson(phoneFile, null) ?? { enabled: false, pin: "111222", tokens: [] };
     if (!config.pin) config.pin = newPin();
     if (!Array.isArray(config.tokens)) config.tokens = [];
     return config;
@@ -907,8 +1179,23 @@ export function createParlorHandler(options = {}) {
       .map((net) => `http://${net.address}:${PHONE_PORT}`);
   }
 
+  // Spotify party mode (server/spotify.mjs): the queue, guests' phones, and music videos from the library.
+  const spotify = createSpotify({ dataDir, sendJson, readBody, musicVideos: async () => (await musicLibrary(false)).videos ?? [] });
+
   // What the PC is showing, so a phone can follow it.
   let nowShowing = null;
+  /** The last channel a synced TV asked the PC to change to. */
+  let tuneRequest = null;
+  /** Complete Sync (see /api/shared). */
+  // On/off is remembered (Data/parlor-shared.json) so a restart of VayaView doesn't quietly turn it off.
+  const sharedFile = path.join(dataDir, "parlor-shared.json");
+  // rev starts at the clock, so after a restart it is still higher than anything a screen has seen.
+  let sharedState = { on: false, rev: Date.now(), epoch: 0, keys: {} };
+  try {
+    sharedState.on = JSON.parse(fs.readFileSync(sharedFile, "utf8")).on === true;
+  } catch {
+    // never turned on
+  }
 
   // ---------------------------------------------------------------- iPhone video (HLS)
   // iPhones take Apple's streaming format. The picture is copied as it is whenever the
@@ -997,7 +1284,7 @@ export function createParlorHandler(options = {}) {
   async function sendHls(req, res, part, query) {
     // /hls/<session>/<media id>/<file>
     const [sid, id, file] = [part[2], part[3], part[4]];
-    const entry = index.get(id ?? "");
+    const entry = mediaEntry(id ?? "");
     if (!sid || !/^[\w-]{6,64}$/.test(sid) || !entry || !file || file.includes("..")) {
       res.statusCode = 404;
       return res.end();
@@ -1376,6 +1663,7 @@ export function createParlorHandler(options = {}) {
       }
     }
     if (url.pathname === "/api/status") return sendJson(res, 200, status);
+    if (url.pathname.startsWith("/api/spotify") || url.pathname.startsWith("/api/party")) return spotify.host(req, res, url);
 
     // Font files the user added, kept in Data\fonts.
     if (url.pathname === "/api/fonts" || url.pathname.startsWith("/api/fonts/file/")) {
@@ -1415,10 +1703,38 @@ export function createParlorHandler(options = {}) {
 
     if (url.pathname === "/api/tmdb" && req.method === "GET") return sendJson(res, 200, tmdbStatus());
     if (url.pathname === "/api/tmdb/metadata") return sendJson(res, 200, readJson(metaFile, {}));
+    if (url.pathname === "/api/music/folder" && req.method === "POST") {
+      const folder = String((await readBody(req))?.folder ?? "").trim().replace(/^"|"$/g, "");
+      if (folder && !fs.existsSync(folder)) return sendJson(res, 400, { error: `${folder} was not found.` });
+      fs.writeFileSync(musicConfigFile, JSON.stringify({ folder }));
+      musicScan = null;
+      return sendJson(res, 200, { folder });
+    }
+    if (url.pathname === "/api/home" && req.method === "GET") return sendJson(res, 200, await homeLibrary(url.searchParams.get("rescan") === "1"));
+    if (url.pathname === "/api/music" && req.method === "GET") return sendJson(res, 200, await musicLibrary(url.searchParams.get("rescan") === "1"));
     if (url.pathname === "/api/tmdb/catalog") {
       if (!tmdb.running) void buildCatalog(url.searchParams.get("refresh") === "1");
       const { collections = {}, top = [] } = readJson(catalogFile, {});
       return sendJson(res, 200, { ...catalogState, collections, top });
+    }
+    // Official artwork for one title (the studio's title logo and stills), for the 3D store's case backs.
+    if (url.pathname === "/api/tmdb/art") {
+      const id = String(url.searchParams.get("id") ?? "");
+      if (!/^(movie|tv)\/\d+$/.test(id)) return sendJson(res, 400, { error: "Bad id" });
+      try {
+        if (!artCache.has(id)) {
+          const token = readJson(tmdbFile, {}).token;
+          if (!token) return sendJson(res, 200, { logo: null, stills: [] });
+          const images = await tmdbGet(`/${id}/images?include_image_language=en,null`, token);
+          const best = (list) => [...(list ?? [])].sort((a, b) => (b.vote_average ?? 0) - (a.vote_average ?? 0));
+          const logo = best((images.logos ?? []).filter((item) => item.iso_639_1 === "en"))[0]?.file_path ?? null;
+          const stills = best((images.backdrops ?? []).filter((item) => !item.iso_639_1)).slice(0, 3).map((item) => item.file_path);
+          artCache.set(id, { logo, stills });
+        }
+        return sendJson(res, 200, artCache.get(id));
+      } catch (error) {
+        return sendJson(res, 200, { logo: null, stills: [], error: error.message });
+      }
     }
     if (url.pathname === "/api/tmdb/search") {
       try {
@@ -1444,7 +1760,7 @@ export function createParlorHandler(options = {}) {
     if (url.pathname === "/api/tmdb/lookup" && req.method === "POST") {
       const body = await readBody(req);
       if (url.searchParams.get("again") === "1") fs.rmSync(metaFile, { force: true });
-      void runLookups(Array.isArray(body?.items) ? body.items : []);
+      void runLookups(Array.isArray(body?.items) ? body.items : [], url.searchParams.get("retry") === "1");
       return sendJson(res, 202, tmdbStatus());
     }
 
@@ -1455,6 +1771,8 @@ export function createParlorHandler(options = {}) {
         if (typeof body.enabled === "boolean") config.enabled = body.enabled;
         // A new PIN also forgets every paired phone.
         if (body.forget) Object.assign(config, { pin: newPin(), tokens: [] });
+        // A PIN the user chose (digits only). Already-paired phones and TVs stay paired.
+        if (typeof body.pin === "string" && /^d{4,8}$/.test(body.pin.trim())) config.pin = body.pin.trim();
         savePhone(config);
         await options.onPhone?.(config.enabled);
       }
@@ -1465,6 +1783,34 @@ export function createParlorHandler(options = {}) {
         addresses: lanAddresses(),
         available: Boolean(options.onPhone),
       });
+    }
+    // A synced TV asking the PC to change channel (the TV then follows the PC as usual). The PC polls this.
+    if (url.pathname === "/api/now/tune") {
+      if (req.method === "POST") {
+        const body = (await readBody(req)) ?? {};
+        if (typeof body.channelId === "string") tuneRequest = { channelId: body.channelId, at: Date.now() };
+      }
+      return sendJson(res, 200, tuneRequest ?? {});
+    }
+    // Complete Sync: every screen (PC, TVs, phones) shows the same thing. Each screen posts what it changed
+    // (mode, channel, pause, title page, film and spot); the others poll and copy it. In memory only.
+    // The PC's clock, so every screen can line up with it (src/lib/server-clock.ts).
+    if (url.pathname === "/api/time") return sendJson(res, 200, { now: Date.now() });
+    if (url.pathname === "/api/shared") {
+      if (req.method === "POST") {
+        const body = (await readBody(req)) ?? {};
+        if (typeof body.on === "boolean") {
+          sharedState = { on: body.on, rev: sharedState.rev + 1, epoch: sharedState.rev + 1, keys: {} };
+          fs.promises.writeFile(sharedFile, JSON.stringify({ on: body.on })).catch(() => {});
+        }
+        else if (sharedState.on && typeof body.key === "string" && body.key.length < 40 && JSON.stringify(body.value ?? null).length < 50_000) {
+          sharedState.rev += 1;
+          // A new mode starts its screens fresh: no title page or film carried over from last time.
+          if (body.key === "mode") for (const key of Object.keys(sharedState.keys)) if (key.startsWith("stream.")) delete sharedState.keys[key];
+          sharedState.keys[body.key] = { value: body.value ?? null, rev: sharedState.rev, from: String(body.from ?? "") };
+        }
+      }
+      return sendJson(res, 200, sharedState);
     }
     if (url.pathname === "/api/now") {
       if (req.method === "POST") nowShowing = { ...(await readBody(req)), at: Date.now() };
@@ -1509,14 +1855,23 @@ export function createParlorHandler(options = {}) {
       return sendJson(res, 200, { folders: wanted });
     }
 
+    if (part[1] === "api" && part[2] === "thumb" && part[3]) {
+      const entry = mediaEntry(part[3]);
+      if (!entry) {
+        res.statusCode = 404;
+        return res.end();
+      }
+      return sendThumb(res, part[3], entry);
+    }
+
     if (part[1] === "media" || part[1] === "subs" || (part[1] === "api" && part[2] === "keyframe")) {
-      const entry = index.get(part[part.length - 1]);
+      const entry = mediaEntry(part[part.length - 1]);
       if (!entry) {
         res.statusCode = 404;
         return res.end();
       }
       if (part[1] === "subs") return sendSubs(res, part[part.length - 1], entry, url.searchParams);
-      if (part[1] === "api") return sendKeyframe(res, entry, Math.max(0, Number(url.searchParams.get("t")) || 0), url.searchParams.get("near") === "1");
+      if (part[1] === "api") return sendKeyframe(res, entry, Math.max(0, Number(url.searchParams.get("t")) || 0), url.searchParams.get("near") === "1", Math.min(120, Math.max(0, Number(url.searchParams.get("warm")) || 0)));
       if (url.searchParams.get("t") != null) return sendSession(res, entry, url.searchParams);
       return sendDirect(req, res, entry);
     }
@@ -1535,6 +1890,8 @@ export function createParlorHandler(options = {}) {
       res.statusCode = 403;
       return res.end("Phone access is switched off in Parlor on the PC.");
     }
+    // Spotify party guests: the page and, with the party code from the QR, the queue. No PIN.
+    if ((await spotify.guest(req, res, url)) !== false) return;
     if (url.pathname === "/api/pair" && req.method === "POST") {
       const now = Date.now();
       while (pairTries.length && now - pairTries[0] > 10 * 60_000) pairTries.shift();
@@ -1550,15 +1907,30 @@ export function createParlorHandler(options = {}) {
       res.setHeader("Set-Cookie", `parlor_phone=${token}; HttpOnly; SameSite=Strict; Path=/; Max-Age=31536000`);
       return sendJson(res, 200, { ok: true });
     }
+    // The Fire TV app, for the Downloader app on a Fire Stick: http://<pc>:47817/tv. Open, like the page itself;
+    // it is only a window onto this server and pairs with the PIN like a phone.
+    if (url.pathname === "/tv" || url.pathname === "/tv.apk") {
+      const apk = path.join(dataDir, "..", "releases", "VayaView-TV.apk");
+      if (!fs.existsSync(apk)) return sendJson(res, 404, { error: "The Fire TV app has not been built on this PC." });
+      res.writeHead(200, {
+        "Content-Type": "application/vnd.android.package-archive",
+        "Content-Disposition": 'attachment; filename="VayaView-TV.apk"',
+        "Content-Length": fs.statSync(apk).size,
+      });
+      return pipeline(fs.createReadStream(apk), res, () => {});
+    }
     if (!/^\/(api|media|subs|hls)(\/|$)/.test(url.pathname)) return next();
     const cookie = /(?:^|;\s*)parlor_phone=([a-f0-9]+)/.exec(req.headers.cookie ?? "")?.[1];
     if (!cookie || !config.tokens.includes(cookie)) return sendJson(res, 401, { error: "pair" });
     const pcOnly =
-      /^\/api\/(phone|config|pick-folder|vintage|tmdb\/token|tmdb\/lookup|pair|update)/.test(url.pathname) ||
+      /^\/api\/(phone|config|pick-folder|vintage|tmdb\/token|tmdb\/lookup|pair|update|spotify\/(login|callback|logout))/.test(url.pathname) ||
       (url.pathname === "/api/fonts" && req.method !== "GET") ||
       (url.pathname === "/api/store" && req.method !== "GET") ||
+      url.pathname === "/api/music/folder" ||
       (url.pathname === "/api/now" && req.method !== "GET");
     if (pcOnly) return sendJson(res, 403, { error: "Only from the PC." });
+    // A paired TV or phone may run Spotify mode, but sign-in and the Client ID stay on the PC.
+    req.vvRemote = true;
     return handler(req, res, next);
   };
   /**
@@ -1566,22 +1938,27 @@ export function createParlorHandler(options = {}) {
    * Parlor closes, so the last good state is always on disk under its own name. The 30 newest stay.
    */
   handler.snapshot = (label) => {
-    try {
-      const file = storeFile(`parlor.v2.disk:${folders().join("|")}`);
-      if (!fs.existsSync(file)) return;
-      const stamp = new Date().toLocaleString("sv-SE").replace(/:/g, ".").slice(0, 16);
-      fs.writeFileSync(path.join(backupDir, `stations ${label} ${stamp}.json`), JSON.parse(fs.readFileSync(file, "utf8")).value);
-      const old = fs.readdirSync(backupDir).filter((name) => name.startsWith(`stations ${label} `)).sort().slice(0, -30);
-      for (const name of old) fs.rmSync(path.join(backupDir, name), { force: true });
-    } catch {
-      // A missed copy must never stop Parlor from closing.
-    }
+    const stamp = new Date().toLocaleString("sv-SE").replace(/:/g, ".").slice(0, 16);
+    const keep = (key, prefix) => {
+      try {
+        const file = storeFile(key);
+        if (!fs.existsSync(file)) return;
+        fs.writeFileSync(path.join(backupDir, `${prefix} ${label} ${stamp}.json`), JSON.parse(fs.readFileSync(file, "utf8")).value);
+        const old = fs.readdirSync(backupDir).filter((name) => name.startsWith(`${prefix} ${label} `)).sort().slice(0, -30);
+        for (const name of old) fs.rmSync(path.join(backupDir, name), { force: true });
+      } catch {
+        // A missed copy must never stop Parlor from closing.
+      }
+    };
+    keep(`parlor.v2.disk:${folders().join("|")}`, "stations");
+    keep(`parlor.v2.music:${musicFolders().join("|")}`, "music-stations");
   };
   handler.dataDir = dataDir;
   handler.phoneEnabled = () => phoneConfig().enabled;
   handler.phonePort = PHONE_PORT;
 
   handler.dispose = () => {
+    spotify.dispose();
     for (const child of children) child.kill();
     for (const control of active.values()) control.abort();
   };
@@ -1593,6 +1970,10 @@ export function parlorApi() {
   return {
     name: "parlor-api",
     configureServer(server) {
+      server.middlewares.use(createParlorHandler({ store: "store-dev", dataDir: process.env.VAYAVIEW_DATA || undefined }));
+    },
+    // `vite preview` of the optimised build, for timing on slow devices like a Fire Stick (dev React is far slower there).
+    configurePreviewServer(server) {
       server.middlewares.use(createParlorHandler({ store: "store-dev", dataDir: process.env.VAYAVIEW_DATA || undefined }));
     },
   };

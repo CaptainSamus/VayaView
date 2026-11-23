@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import { durable } from "@/lib/durable";
+import { catalogById } from "@/lib/library/catalog";
 import { cn } from "@/lib/cn";
 import { formatStation, formatTime } from "@/lib/format";
 import { guideFrom } from "@/lib/schedule/engine";
@@ -17,19 +18,45 @@ type GuideGridProps = {
   onMenu: (id: string, x: number, y: number) => void;
   /** Phone width: a slimmer station column, no favorite stars. */
   narrow?: boolean;
+  /** Music videos: a few minutes each, so the grid zooms in (5-minute marks) and shows artist and song. */
+  music?: boolean;
   className?: string;
 };
 
-const HALF_HOUR = 30 * 60_000;
-/** How much of the evening the grid shows. */
-const WINDOW_MS = 5 * HALF_HOUR;
+const MINUTE = 60_000;
+
+/** One colour per artist, spread round the colour wheel so neighbours rarely look alike. */
+function artistHue(mediaId: string): number | null {
+  const name = catalogById.get(mediaId)?.collection;
+  if (!name) return null;
+  let hash = 0;
+  for (const char of name.toLowerCase()) hash = (hash * 31 + char.charCodeAt(0)) >>> 0;
+  return Math.round((hash * 137.508) % 360);
+}
+/** Films: two and a half hours in half-hour marks. Music: zoom levels, remembered. */
+const FILM_SCALE = { tick: 30 * MINUTE, window: 150 * MINUTE };
+const MUSIC_SCALES = [
+  { tick: 5 * MINUTE, window: 15 * MINUTE },
+  { tick: 5 * MINUTE, window: 25 * MINUTE },
+  { tick: 10 * MINUTE, window: 50 * MINUTE },
+];
 
 /**
  * The listings. One row per station, time running left to right from the last
  * half hour. Clicking anywhere on a row tunes that station live. It never
  * starts a later programme early.
  */
-export function GuideGrid({ channels, tunedId, now, missing, library, onTune, onFavorite, onMenu, narrow, className }: GuideGridProps) {
+export function GuideGrid({ channels, tunedId, now, missing, library, onTune, onFavorite, onMenu, narrow, music = false, className }: GuideGridProps) {
+  const [zoom, setZoom] = useState(() => {
+    const saved = Number(durable.getItem("parlor.musicGuideZoom"));
+    return saved >= 0 && saved < MUSIC_SCALES.length && durable.getItem("parlor.musicGuideZoom") != null ? saved : 1;
+  });
+  useEffect(() => {
+    if (music) durable.setItem("parlor.musicGuideZoom", String(zoom));
+  }, [music, zoom]);
+  const scale = music ? MUSIC_SCALES[zoom] : FILM_SCALE;
+  const HALF_HOUR = scale.tick;
+  const WINDOW_MS = scale.window;
   // The station column is as wide as the user drags it (like a panel edge in Premiere). Remembered.
   const [columnPx, setColumnPx] = useState(() => {
     const saved = Number(durable.getItem("parlor.guideColumn"));
@@ -69,7 +96,7 @@ export function GuideGrid({ channels, tunedId, now, missing, library, onTune, on
         .filter((channel) => !filtered || channel.favorite)
         .sort((a, b) => a.number - b.number || a.name.localeCompare(b.name))
         .map((channel) => ({ channel, slots: guideFrom(channel, library, missing, start, WINDOW_MS) })),
-    [channels, filtered, library, missing, start],
+    [channels, filtered, library, missing, start, WINDOW_MS],
   );
 
   useEffect(() => {
@@ -107,6 +134,16 @@ export function GuideGrid({ channels, tunedId, now, missing, library, onTune, on
           >
             ★ Favorites
           </button>
+          {music ? (
+            <span className="flex gap-1">
+              <button type="button" title="Zoom out: more time across the guide" disabled={zoom >= MUSIC_SCALES.length - 1} onClick={() => setZoom((value) => value + 1)} className="size-6 rounded-md bg-cream/10 text-cream/80 hover:bg-cream/20 disabled:opacity-30">
+                −
+              </button>
+              <button type="button" title="Zoom in: bigger song blocks" disabled={zoom <= 0} onClick={() => setZoom((value) => value - 1)} className="size-6 rounded-md bg-cream/10 text-cream/80 hover:bg-cream/20 disabled:opacity-30">
+                +
+              </button>
+            </span>
+          ) : null}
         </div>
         <div className="relative flex min-w-0 flex-1">
           {ticks.map((tick) => (
@@ -175,6 +212,7 @@ export function GuideGrid({ channels, tunedId, now, missing, library, onTune, on
                   const right = Math.min(100, ((item.endsAtMs - start) / WINDOW_MS) * 100);
                   if (right <= left) return null;
                   const onNow = item.startsAtMs <= now && now < item.endsAtMs;
+                  const hue = music && !(onNow && tuned) ? artistHue(item.slot.mediaId) : null;
                   return (
                     <div
                       key={`${item.slot.mediaId}-${item.startsAtMs}`}
@@ -183,7 +221,13 @@ export function GuideGrid({ channels, tunedId, now, missing, library, onTune, on
                         left: `${left}%`,
                         width: `${right - left}%`,
                         // The programme on now carries the station's colour, so a favourite reads across the whole row.
-                        backgroundColor: onNow && !tuned && color ? `color-mix(in srgb, ${color} 45%, transparent)` : undefined,
+                        backgroundColor:
+                          hue != null
+                            ? `hsl(${hue} 55% ${onNow ? 42 : 30}%)`
+                            : onNow && !tuned && color
+                              ? `color-mix(in srgb, ${color} 45%, transparent)`
+                              : undefined,
+                        color: hue != null ? "rgb(255 255 255 / 0.92)" : undefined,
                       }}
                       className={cn(
                         "absolute top-1 bottom-1 flex items-center overflow-hidden rounded-md border-x-2 border-bezel px-2 text-xs",
@@ -191,7 +235,14 @@ export function GuideGrid({ channels, tunedId, now, missing, library, onTune, on
                         item.slot.status === "missing" ? "slot-missing" : "",
                       )}
                     >
-                      <span className="truncate">{item.slot.title}</span>
+                      {music && item.slot.title.includes(" — ") ? (
+                        <span className="min-w-0 leading-tight">
+                          <span className="block truncate text-[0.65rem] opacity-70">{item.slot.title.split(" — ")[0]}</span>
+                          <span className="block truncate font-semibold">{item.slot.title.split(" — ").slice(1).join(" — ")}</span>
+                        </span>
+                      ) : (
+                        <span className="truncate">{item.slot.title}</span>
+                      )}
                     </div>
                   );
                 })}

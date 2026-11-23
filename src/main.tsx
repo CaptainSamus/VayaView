@@ -1,7 +1,8 @@
 import "./styles.css";
 import { useState, type FormEvent } from "react";
 import { createRoot } from "react-dom/client";
-import { isRemote } from "@/lib/remote";
+import { isRemote, isTv } from "@/lib/remote";
+import { installTvNav } from "@/lib/tv-nav";
 import { loadDiskLibrary } from "@/lib/library/disk";
 import { loadDurable } from "@/lib/durable";
 import { applyFonts, loadFonts } from "@/lib/fonts";
@@ -60,6 +61,7 @@ function Pair() {
 
 async function boot() {
   const root = createRoot(document.getElementById("root")!);
+  if (isTv) installTvNav();
   if (isRemote) {
     const check = await fetch("/api/store").catch(() => null);
     if (check?.status === 401) return root.render(<Pair />);

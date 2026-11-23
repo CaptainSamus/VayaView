@@ -296,7 +296,7 @@ function showYear(show: string, films: Film[]): string {
  * to, its director and keywords. Titles not looked up yet are queued; the PC does
  * the asking, once per title, and only when a token has been saved.
  */
-async function applyMetadata(films: Film[]): Promise<void> {
+async function applyMetadata(films: Film[], follow = true): Promise<void> {
   let meta: Record<string, Meta> = {};
   try {
     meta = (await (await fetch("/api/tmdb/metadata")).json()) as Record<string, Meta>;
@@ -348,12 +348,145 @@ async function applyMetadata(films: Film[]): Promise<void> {
   }
   libraryInfo.metaItems = items;
   if (!isRemote && items.some((item) => !meta[item.key] || (meta[item.key].found && (meta[item.key].v ?? 1) < META_VERSION))) {
-    void fetch("/api/tmdb/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) }).catch(() => {});
+    void fetch("/api/tmdb/lookup", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items }) })
+      .then(() => follow && void afterLookups())
+      .catch(() => {});
   }
 }
 
+/** Sent on `window` when the film library (or its posters) has changed, so the views read it again. */
+export const LIBRARY_EVENT = "vv-library";
+let following = false;
+
+/** Waits for the PC's TMDB lookups to finish. */
+async function lookupsDone(): Promise<void> {
+  for (let i = 0; i < 900; i++) {
+    await new Promise((resolve) => setTimeout(resolve, 2000));
+    try {
+      const status = (await (await fetch("/api/tmdb")).json()) as { running?: boolean };
+      if (!status.running) return;
+    } catch {
+      return;
+    }
+  }
+}
+
+/**
+ * New films are looked up on the PC in the background. Before, their posters only showed after
+ * a restart; now the library is read again as soon as the lookups finish.
+ */
+async function afterLookups(): Promise<void> {
+  if (following) return;
+  following = true;
+  try {
+    await lookupsDone();
+    if (libraryInfo.source !== "tv") return;
+    await loadDiskLibrary(false, false);
+    window.dispatchEvent(new Event(LIBRARY_EVENT));
+  } finally {
+    following = false;
+  }
+}
+
+/**
+ * The refresh button: look for new files, ask TMDB again about every title (even ones it
+ * couldn't match before), wait for the answers, and lay the posters on.
+ */
+export async function refreshLibrary(): Promise<void> {
+  if (libraryInfo.source !== "tv") return;
+  await loadDiskLibrary(true, false);
+  window.dispatchEvent(new Event(LIBRARY_EVENT));
+  try {
+    await fetch("/api/tmdb/lookup?retry=1", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ items: libraryInfo.metaItems }) });
+    await lookupsDone();
+  } catch {
+    // Offline: the files are still refreshed.
+  }
+  await loadDiskLibrary(false, false);
+  window.dispatchEvent(new Event(LIBRARY_EVENT));
+}
+
+type MusicVideo = {
+  id: string;
+  rel: string;
+  durationMs: number;
+  direct: boolean;
+  vcodec: string;
+  height: number;
+  addedMs?: number;
+  audio: Film["audio"];
+  missing: boolean;
+  artist: string;
+  lead: string;
+  title: string;
+  year: number;
+  genre: string;
+};
+
+/**
+ * The music videos as the schedule sees them. The artist is the "director" and the
+ * main act the "collection", so a station search for an artist finds all their videos;
+ * the decade ("80s") and genre are searchable too.
+ */
+function musicFilm(video: MusicVideo): Film {
+  const decade = video.year ? `${String(Math.floor(video.year / 10) * 10).slice(video.year >= 2000 ? 0 : 2)}s` : "";
+  return {
+    id: video.id,
+    title: video.artist ? `${video.artist} — ${video.title}` : video.title,
+    year: video.year,
+    durationMs: video.durationMs,
+    director: video.artist,
+    genres: ["Music", ...(video.genre ? [video.genre] : [])],
+    keywords: [decade, ...video.artist.split(/\s*(?:,|&|\bfeat\.?|\bft\.|\bx\b|\band\b)\s*/i)].filter(Boolean),
+    collection: video.lead || null,
+    synopsis: video.title,
+    scenes: [],
+    // Any path marks it playable; the server finds the file by its id.
+    filePath: video.rel,
+    metadataId: null,
+    fileName: video.rel,
+    direct: video.direct,
+    vcodec: video.vcodec,
+    height: video.height,
+    audio: video.audio,
+    subs: [],
+  };
+}
+
+/** The music folder (G:\MUSIC by default). Years and genres fill in as they are looked up. */
+export async function loadMusicLibrary(rescan = false): Promise<{ looking: number }> {
+  libraryInfo.error = null;
+  try {
+    const response = await fetch(rescan ? "/api/music?rescan=1" : "/api/music");
+    const data = (await response.json()) as { folder: string | null; videos: MusicVideo[]; looking: number; error: string | null };
+    if (data.error) throw new Error(data.error);
+    libraryInfo.folders = data.folder ? [data.folder] : [];
+    setDiskLibrary(
+      data.videos.map(musicFilm),
+      data.videos.filter((video) => video.missing).map((video) => video.id),
+    );
+    return { looking: data.looking };
+  } catch (error) {
+    libraryInfo.error = error instanceof Error ? error.message : String(error);
+    setDiskLibrary([], []);
+    return { looking: 0 };
+  }
+}
+
+/** Swap between the film library and the music library. Everything that reads CATALOG sees the new one. */
+export async function switchLibrary(source: "tv" | "music"): Promise<void> {
+  if (libraryInfo.source === source) return;
+  libraryInfo.source = source;
+  if (source === "music") await loadMusicLibrary();
+  else await loadDiskLibrary();
+}
+
 /** `rescan` walks the folders again; otherwise a scan from the last ten minutes may be reused. */
-export async function loadDiskLibrary(rescan = false): Promise<void> {
+export async function loadDiskLibrary(rescan = false, follow = true): Promise<void> {
+  if (libraryInfo.source === "music") {
+    await loadMusicLibrary(rescan);
+    return;
+  }
   libraryInfo.error = null;
   try {
     const response = await fetch(rescan ? "/api/library?rescan=1" : "/api/library");
@@ -365,7 +498,7 @@ export async function loadDiskLibrary(rescan = false): Promise<void> {
     if (data.films.length === 0) return;
     const missing = new Set(data.films.filter((file) => file.missing).map((file) => file.id));
     const films = buildLibrary(data.films);
-    await applyMetadata(films);
+    await applyMetadata(films, follow);
     setDiskLibrary(
       films,
       films.filter((film) => missing.has(film.id)).map((film) => film.id),
