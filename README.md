@@ -14,6 +14,7 @@ Desktop app for Windows and macOS (Electron). Plays your files with the help of 
 - **Update:** Settings → Updates → *Update to …*. The new version replaces the old one in place, so there
   is only ever one copy.
 - **Needs:** ffmpeg and ffprobe on the PATH (`winget install Gyan.FFmpeg`).
+- **Fire TV / Fire TV Stick:** install `VayaView-TV.apk` from the release; see [docs/FIRE-TV.md](docs/FIRE-TV.md) for setup, the remote and troubleshooting.
 
 ### On a Mac
 
