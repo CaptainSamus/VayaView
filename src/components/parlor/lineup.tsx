@@ -50,6 +50,50 @@ const LIST_LIMIT = 150;
  * The station editor. It takes the guide's place under the picture, so the
  * programme keeps playing in view while stations are changed.
  */
+type BackupFile = { rel: string; title?: string; year?: number; durationMs?: number };
+
+/** A path in a comparable form: lower case, forward slashes, no drive. */
+function relPath(file: string) {
+  return file.replace(/\\/g, "/").replace(/^[a-z]:/i, "").toLowerCase();
+}
+const baseName = (file: string) => file.slice(file.lastIndexOf("/") + 1);
+const titleKey = (title?: string, year?: number) => `${(title ?? "").toLowerCase().replace(/[^a-z0-9]+/g, "")}|${year ?? 0}`;
+
+/**
+ * Maps a backup's film ids to this PC's. An id this library has is kept. Otherwise the film is
+ * found by the end of its path (same folder and file), then its file name, then title + year.
+ */
+function relink(files: Record<string, BackupFile>) {
+  const byName = new Map<string, Film[]>();
+  const byTitle = new Map<string, Film>();
+  for (const film of CATALOG) {
+    const rel = relPath(film.filePath ?? film.fileName ?? "");
+    const name = baseName(rel);
+    if (name) byName.set(name, [...(byName.get(name) ?? []), film]);
+    byTitle.set(titleKey(film.title, film.year), film);
+  }
+  const missed = new Set<string>();
+  const to = (id: string): string | null => {
+    if (catalogById.has(id)) return id;
+    const info = files[id];
+    if (!info) {
+      missed.add(id);
+      return null;
+    }
+    const rel = relPath(info.rel);
+    const named = byName.get(baseName(rel)) ?? [];
+    const parts = rel.split("/").filter(Boolean);
+    const tail = parts.slice(-2).join("/");
+    const hit =
+      named.find((film) => relPath(film.filePath ?? "").endsWith(tail)) ??
+      (named.length === 1 ? named[0] : named.find((film) => Math.abs(film.durationMs - (info.durationMs ?? 0)) < 2000)) ??
+      byTitle.get(titleKey(info.title, info.year));
+    if (!hit) missed.add(id);
+    return hit?.id ?? null;
+  };
+  return { to, missed };
+}
+
 export function Lineup({ state, dispatch, onClose, history, onUndo, onRestore, focusId, onMenu, className }: LineupProps) {
   const [openId, setOpenId] = useState<string | null>(focusId ?? state.tunedId);
   useEffect(() => {
@@ -115,8 +159,14 @@ export function Lineup({ state, dispatch, onClose, history, onUndo, onRestore, f
 
   /** The stations as a file you keep. Loading one back can itself be undone. */
   function saveBackup() {
+    // Each film's file name and length too, so another PC (films in other folders, so other ids) can find its own copy.
+    const files: Record<string, BackupFile> = {};
+    for (const id of [...state.channels.flatMap((item) => item.mediaIds), ...(state.hiddenIds ?? [])]) {
+      const film = catalogById.get(id);
+      if (film && !files[id]) files[id] = { rel: relPath(film.filePath ?? film.fileName ?? ""), title: film.title, year: film.year, durationMs: film.durationMs };
+    }
     const body = JSON.stringify(
-      { app: "vayaview", version: 1, savedAt: new Date().toISOString(), folders: libraryInfo.folders, channels: state.channels, hiddenIds: state.hiddenIds ?? [] },
+      { app: "vayaview", version: 1, savedAt: new Date().toISOString(), folders: libraryInfo.folders, channels: state.channels, hiddenIds: state.hiddenIds ?? [], files },
       null,
       2,
     );
@@ -130,12 +180,18 @@ export function Lineup({ state, dispatch, onClose, history, onUndo, onRestore, f
 
   async function loadBackup(file: File) {
     try {
-      const data = JSON.parse(await file.text()) as { app?: string; savedAt?: string; channels?: unknown; hiddenIds?: unknown };
+      const data = JSON.parse(await file.text()) as { app?: string; savedAt?: string; channels?: unknown; hiddenIds?: unknown; files?: Record<string, BackupFile> };
       const checked = (data.app === "vayaview" || data.app === "parlor") ? sanitizeState({ ...state, channels: data.channels }) : null;
       if (!checked) throw new Error("not a backup");
       const hidden = Array.isArray(data.hiddenIds) ? data.hiddenIds.filter((id): id is string => typeof id === "string") : [];
-      onRestore(checked.channels, hidden, `Loaded backup from ${(data.savedAt ?? "").slice(0, 10) || file.name}`);
-      setBackupNote(`Loaded ${checked.channels.length} stations from ${file.name}. Undo puts back what you had.`);
+      // From another PC: its film ids are not ours, so each film is found here by its file name (see relink).
+      const link = relink(data.files ?? {});
+      const channels = checked.channels.map((item) => ({ ...item, mediaIds: [...new Set(item.mediaIds.map(link.to).filter((id): id is string => id != null))] }));
+      const hiddenHere = hidden.map(link.to).filter((id): id is string => id != null);
+      onRestore(channels, hiddenHere, `Loaded backup from ${(data.savedAt ?? "").slice(0, 10) || file.name}`);
+      setBackupNote(
+        `Loaded ${channels.length} stations from ${file.name}${link.missed.size ? ` (${link.missed.size} films aren't on this PC)` : ""}. Undo puts back what you had.`,
+      );
     } catch {
       setBackupNote(`${file.name} is not a VayaView stations backup.`);
     }
